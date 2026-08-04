@@ -1,0 +1,5 @@
+[alias]
+t = "test --workspace"
+c = "clippy --workspace -- -D warnings"
+f = "fmt --all"
+cli = "run -p secrets-cli --"

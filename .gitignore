@@ -19,3 +19,27 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+# Rust
+/target
+Cargo.lock.bak
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Vaults & secrets (never commit)
+*.db
+*.db-*
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+vault-backup.enc
+*.enc
+
+# Local agent / tool state
+.direnv/
