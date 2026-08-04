@@ -41,6 +41,6 @@ En un PC nuevo el vault se crea solo al aplicar `001`. En uno viejo solo corren 
 ## Inspección
 
 ```bash
-secrets status   # (puede mostrar schema version en el futuro)
+vltr status   # (puede mostrar schema version en el futuro)
 sqlite3 vault.db "SELECT * FROM schema_migrations;"
 ```

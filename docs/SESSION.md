@@ -7,9 +7,9 @@ Cada uso exitoso de la sesión **renueva** el contador (sliding expiration). Si 
 ## Comandos
 
 ```bash
-secrets unlock    # password + sesión 30 min
-secrets lock      # borra sesión de inmediato
-secrets status    # muestra tiempo restante
+vltr unlock    # password + sesión 30 min
+vltr lock      # borra sesión de inmediato
+vltr status    # muestra tiempo restante
 ```
 
 ## Parámetros
@@ -18,7 +18,7 @@ secrets status    # muestra tiempo restante
 |-----------|--------|
 | TTL | 30 minutos |
 | Renovación | En cada `load` exitoso (cualquier comando que use la sesión) |
-| Service | `dev.secrets-manager.vault` |
+| Service | `dev.vltr-manager.vault` |
 | Account | `master-key-session` |
 | Payload | JSON `{ key_hex, expires_at }` |
 
@@ -26,5 +26,5 @@ secrets status    # muestra tiempo restante
 
 - El vault en disco sigue cifrado.
 - La sesión limita la ventana de abuso si dejas el equipo desatendido.
-- `secrets lock` o logout del SO eliminan la credencial.
+- `vltr lock` o logout del SO eliminan la credencial.
 - Sin keyring disponible, la CLI pide password en cada comando.

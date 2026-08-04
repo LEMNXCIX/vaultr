@@ -1,32 +1,32 @@
 # CLI — comandos objetivo MVP
 
-Binario: `secrets`
+Binario: `vltr`
 
 ```text
-secrets init
-secrets unlock
-secrets status
+vltr init
+vltr unlock
+vltr status
 
-secrets project create <name> [--desc TEXT] [--color COLOR]
-secrets project list
-secrets project delete <name>
+vltr project create <name> [--desc TEXT] [--color COLOR]
+vltr project list
+vltr project delete <name>
 
-secrets env list <project>
-secrets env create <project> <name>
-secrets env set-default <project> <name>
+vltr env list <project>
+vltr env create <project> <name>
+vltr env set-default <project> <name>
 
-secrets set <project> <env> <key> [value]
-secrets get <project> <env> <key> [--copy]
-secrets list <project> <env>
-secrets delete <project> <env> <key>
+vltr set <project> <env> <key> [value]
+vltr get <project> <env> <key> [--copy]
+vltr list <project> <env>
+vltr delete <project> <env> <key>
 
-secrets import <project> <env> <path.env>
-secrets export <project> <env> [--output path]
-secrets apply <project> <env> [--path .env]
+vltr import <project> <env> <path.env>
+vltr export <project> <env> [--output path]
+vltr apply <project> <env> [--path .env]
 
-secrets search <query> [--project NAME]
-secrets backup <path.enc>
-secrets restore <path.enc>
+vltr search <query> [--project NAME]
+vltr backup <path.enc>
+vltr restore <path.enc>
 ```
 
 Prioridad de implementación restante: `import`, `delete`, `search`, `backup`/`restore`, `apply`.

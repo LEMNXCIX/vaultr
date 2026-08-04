@@ -3,28 +3,28 @@
 ## Generar
 
 ```bash
-cargo build -p secrets-cli
+cargo build -p vltr-cli
 
 # Bash
-./target/debug/secrets completions bash > /etc/bash_completion.d/secrets
+./target/debug/vltr completions bash > /etc/bash_completion.d/vltr
 # o
-./target/debug/secrets completions bash >> ~/.bashrc
+./target/debug/vltr completions bash >> ~/.bashrc
 
 # Zsh
 mkdir -p ~/.zfunc
-./target/debug/secrets completions zsh > ~/.zfunc/_secrets
+./target/debug/vltr completions zsh > ~/.zfunc/_vltr
 # en ~/.zshrc: fpath=(~/.zfunc $fpath) && autoload -Uz compinit && compinit
 
 # Fish
-./target/debug/secrets completions fish > ~/.config/fish/completions/secrets.fish
+./target/debug/vltr completions fish > ~/.config/fish/completions/vltr.fish
 
 # Elvish / PowerShell
-./target/debug/secrets completions elvish
-./target/debug/secrets completions powershell
+./target/debug/vltr completions elvish
+./target/debug/vltr completions powershell
 ```
 
 Helper:
 
 ```bash
-./scripts/install-completions.sh zsh > ~/.zfunc/_secrets
+./scripts/install-completions.sh zsh > ~/.zfunc/_vltr
 ```

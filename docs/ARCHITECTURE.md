@@ -29,7 +29,7 @@
 
 ## Flujo de un secreto
 
-1. Usuario: `secrets set Fudi local OPENAI_API_KEY sk-...`
+1. Usuario: `vltr set Fudi local OPENAI_API_KEY sk-...`
 2. CLI parsea y pide unlock si hace falta.
 3. `core::App::set_variable`:
    - Resuelve project + environment
