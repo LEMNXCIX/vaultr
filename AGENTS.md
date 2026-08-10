@@ -8,7 +8,7 @@ Gestor de secretos **local-first** y **zero-knowledge** para desarrolladores, es
 
 - Fuente de verdad: SQLite local cifrado a nivel de aplicación
 - UI principal futura: GPUI (Zed)
-- Interfaz prioritaria del MVP: CLI (`secrets`)
+- Interfaz prioritaria del MVP: CLI (`vltr`)
 - Modelo mental: `Project → Environment → Variable` (como un `.env` enriquecido)
 
 ## Principios no negociables
@@ -27,7 +27,7 @@ crates/
   storage/  # SQLite + schema + repositorio
   core/     # Use cases / servicios de negocio
   sync/     # Stub (Supabase futuro)
-  cli/      # Binario `secrets`
+  cli/      # Binario `vltr` (package `vltr-cli`)
 apps/
   desktop/  # GPUI (fase posterior)
 ```
@@ -66,11 +66,21 @@ apps/
 5. No añadir dependencias C si se puede evitar (preferir pure Rust).
 6. No implementar sharing, móvil, extensiones de navegador ni resolución avanzada de conflictos en el MVP.
 
+## Validación local y CI (local-first)
+
+- Hooks de git activados con `./scripts/install-hooks.sh` (`core.hooksPath = .githooks`):
+  - **pre-commit**: `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings`.
+  - **pre-push**: `cargo test --workspace` + `cargo check -p vltr-cli`.
+- Saltar hooks solo en emergencia: `git commit --no-verify` / `git push --no-verify`.
+- **Nunca** `cargo build --release` en cada PR (solo en tags `v*` vía `.github/workflows/release.yml`).
+- Un PR de solo docs no ejecuta jobs de Rust (paths-filter en `ci.yml`).
+- Ver `docs/CI_CD.md`.
+
 ## Comandos útiles
 
 ```bash
-cargo build -p secrets-cli
-cargo run -p secrets-cli -- --help
+cargo build -p vltr-cli
+cargo run -p vltr-cli -- --help
 cargo test -p crypto
 cargo test -p core
 cargo clippy --workspace -- -D warnings
@@ -99,12 +109,12 @@ Conventional Commits en inglés o español, preferiblemente:
 - `docs/ARCHITECTURE.md` — diseño y capas
 - `docs/ROADMAP.md` — fases del MVP
 - `crates/storage/src/schema.rs` — schema SQL
-- `.agents/skills/secrets-dev/SKILL.md` — skill específica del proyecto
+- `.agents/skills/vaultr/SKILL.md` — skill específica del proyecto
 
 ## Completions
 
 ```bash
-secrets completions bash|zsh|fish|elvish|powershell
+vltr completions bash|zsh|fish|elvish|powershell
 ```
 
 Ver `docs/COMPLETIONS.md`.
@@ -112,7 +122,7 @@ Ver `docs/COMPLETIONS.md`.
 ## Sesión keyring
 
 Tras unlock, la master key se guarda en el OS keyring (`core::session`).  
-`secrets lock` la elimina. Ver `docs/SESSION.md`.
+`vltr lock` la elimina. Ver `docs/SESSION.md`.
 
 ## Schema / migraciones
 

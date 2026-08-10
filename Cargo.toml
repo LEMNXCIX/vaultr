@@ -9,14 +9,14 @@ members = [
     "crates/cli",
     # "apps/desktop",  # se activará en la fase de GPUI
 ]
-default-members = ["crates/cli"]
+default-members = ["vltr-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Your Name <you@example.com>"]
-repository = "https://github.com/yourname/secrets-manager"
+repository = "https://github.com/LEMNXCIX/vaultr"
 rust-version = "1.75"
 
 [workspace.dependencies]

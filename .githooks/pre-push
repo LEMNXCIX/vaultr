@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Local checks before every push: full test suite + CLI type-check.
+#
+# Skip only for emergencies:
+#   git push --no-verify
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+echo "▶ cargo test --workspace"
+cargo test --workspace
+
+echo "▶ cargo check -p vltr-cli"
+cargo check -p vltr-cli

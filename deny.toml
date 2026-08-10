@@ -1,0 +1,35 @@
+# cargo-deny configuration — see https://embarkstudios.github.io/cargo-deny/
+# Consumed by .github/workflows/audit.yml (weekly + manual).
+
+[graph]
+
+[bans]
+# Workspace resolves crates individually; don't fail on duplicate versions yet.
+multiple-versions = "allow"
+wildcards = "allow"
+highlight = "all"
+
+[licenses]
+version = 2
+# Keep the dependency tree to permissive licenses (MIT/Apache preferred).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+# Ignore the workspace's own unpublished crates.
+private = { ignore = true }
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+db-path = "~/.cargo/advisory-db"
+vulnerability = "deny"
+unmaintained = "allow"
+yanked = "deny"
+notice = "deny"

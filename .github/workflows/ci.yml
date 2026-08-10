@@ -1,39 +1,102 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main, master]
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  check:
+  # Detect whether anything Rust-relevant changed. Docs-only PRs skip all
+  # heavy Rust jobs (fmt/clippy/test) below.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rustfmt.toml'
+              - 'clippy.toml'
+              - '.cargo/**'
+              - '.githooks/**'
+              - 'scripts/**'
+              - 'Makefile'
+              - 'deny.toml'
+
+  fmt:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all -- --check
 
+  clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
+  test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test (workspace)
         run: cargo test --workspace
 
-      - name: Build CLI (release)
-        run: cargo build -p secrets-cli --release
+      - name: Check CLI
+        run: cargo check -p vltr-cli
 
-      - name: Completions smoke
+      - name: Build CLI (debug, no release)
+        run: cargo build -p vltr-cli
+
+      - name: Completions smoke (debug binary)
         run: |
-          ./target/release/secrets completions bash | head -5
-          ./target/release/secrets completions zsh | head -5
+          ./target/debug/vltr completions bash | head -5
+          ./target/debug/vltr completions zsh | head -5
+          ./target/debug/vltr completions fish | head -5

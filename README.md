@@ -1,4 +1,4 @@
-# Secrets Manager
+# Vaultr — Secrets Manager
 
 Gestor de secretos **local-first** y **zero-knowledge** para desarrolladores.
 
@@ -24,15 +24,19 @@ Al crear un proyecto se crea automáticamente el environment `local`.
 
 ```bash
 # Requisitos: Rust estable reciente
-cargo build -p secrets-cli
+cargo build -p vltr-cli
 cargo test --workspace
-cargo run -p secrets-cli -- --help
+cargo run -p vltr-cli -- --help
+
+# Activa los hooks de git (fmt+clippy en commit, tests en push)
+./scripts/install-hooks.sh
 ```
 
 Atajos (`Makefile` / cargo aliases):
 
 ```bash
-make check          # fmt + clippy + test
+make check          # fmt + clippy + test (gate local)
+make ci             # replica local de ci.yml, sin release
 make cli ARGS=status
 cargo cli -- status
 ```
@@ -55,23 +59,24 @@ AGENTS.md             # Instrucciones para cualquier agente
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Capas y cifrado |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Fases del MVP |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Estilo y PRs |
-| `.agents/skills/secrets-dev/` | Skill de desarrollo del proyecto |
+| [docs/CI_CD.md](docs/CI_CD.md) | Flujo de hooks, CI y releases |
+| `.agents/skills/vaultr/` | Skill de desarrollo del proyecto |
 
 ## CLI (MVP en progreso)
 
 ```bash
-secrets completions zsh > ~/.zfunc/_secrets
+vltr completions zsh > ~/.zfunc/_vltr
 ```
 
 
 ```bash
-secrets init
-secrets project create Fudi
-secrets set Fudi local OPENAI_API_KEY sk-...
-secrets get Fudi local OPENAI_API_KEY --copy
-secrets export Fudi local
-secrets list Fudi local
-secrets status
+vltr init
+vltr project create Fudi
+vltr set Fudi local OPENAI_API_KEY sk-...
+vltr get Fudi local OPENAI_API_KEY --copy
+vltr export Fudi local
+vltr list Fudi local
+vltr status
 ```
 
 ## Licencia
