@@ -23,6 +23,14 @@ mkdir -p ~/.zfunc
 ./target/debug/vltr completions powershell
 ```
 
+Desde PowerShell 7 en Windows, genera el script desde WSL y cárgalo en la
+sesión actual:
+
+```powershell
+wsl -d archlinux -- bash -lc 'cd ~/Repositories/vaultr && cargo run -- completions powershell' |
+  Out-String | Invoke-Expression
+```
+
 Helper:
 
 ```bash

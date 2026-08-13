@@ -18,7 +18,7 @@ vltr status    # muestra tiempo restante
 |-----------|--------|
 | TTL | 30 minutos |
 | Renovación | En cada `load` exitoso (cualquier comando que use la sesión) |
-| Service | `dev.vltr-manager.vault` |
+| Service | `dev.secrets-manager.vault` (se conserva para no invalidar sesiones existentes) |
 | Account | `master-key-session` |
 | Payload | JSON `{ key_hex, expires_at }` |
 
@@ -27,4 +27,4 @@ vltr status    # muestra tiempo restante
 - El vault en disco sigue cifrado.
 - La sesión limita la ventana de abuso si dejas el equipo desatendido.
 - `vltr lock` o logout del SO eliminan la credencial.
-- Sin keyring disponible, la CLI pide password en cada comando.
+- Sin un servicio de keyring disponible, la CLI avisa y pide password en cada comando. En WSL suele requerir un servicio como `gnome-keyring` ejecutándose dentro de la distribución.

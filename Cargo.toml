@@ -9,7 +9,7 @@ members = [
     "crates/cli",
     # "apps/desktop",  # se activará en la fase de GPUI
 ]
-default-members = ["vltr-cli"]
+default-members = ["crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +24,7 @@ rust-version = "1.75"
 models = { path = "crates/models" }
 crypto = { path = "crates/crypto" }
 storage = { path = "crates/storage" }
-core = { path = "crates/core" }
+vltr-core = { path = "crates/core" }
 sync = { path = "crates/sync" }
 
 # Crypto (pinned for Rust 1.75 compatibility)

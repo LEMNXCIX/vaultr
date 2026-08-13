@@ -1,0 +1,26 @@
+[package]
+name = "vltr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vltr"
+path = "src/main.rs"
+
+[dependencies]
+vltr-core = { workspace = true }
+models = { workspace = true }
+storage = { workspace = true }
+crypto = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+secrecy = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arboard = { workspace = true }
+rpassword = "7"
+
+[lints]
+workspace = true

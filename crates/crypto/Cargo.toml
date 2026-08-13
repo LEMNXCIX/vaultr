@@ -1,0 +1,24 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+models = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+aead = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+rand = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+subtle = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

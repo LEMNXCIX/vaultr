@@ -1,0 +1,28 @@
+[package]
+name = "vltr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+models = { workspace = true }
+crypto = { workspace = true }
+storage = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+keyring = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+secrecy = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,7 +8,7 @@
 - [x] Backup cifrado + restore + apply
 - [x] CLI completa del MVP
 - [x] Tests unitarios/integración
-- [x] Autocompletado shell (`secrets completions <shell>`)
+- [x] Autocompletado shell (`vltr completions <shell>`)
 - [x] Clippy workspace lints + CI endurecido
 - [x] Migraciones SQL versionadas (`001_initial` + runner)
 
