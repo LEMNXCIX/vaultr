@@ -31,12 +31,9 @@ sync = { path = "crates/sync" }
 argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 aead = "0.5.2"
-hkdf = "0.12.4"
-sha2 = "0.10.8"
 zeroize = { version = "1.7.0", features = ["derive"] }
 secrecy = "0.8"
 rand = "0.8.5"
-getrandom = "=0.2.15"
 
 # Serialization & data
 serde = { version = "1.0.203", features = ["derive"] }
@@ -64,7 +61,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tempfile = "3.10.1"
 keyring = "3.6.1"
 hex = "0.4.3"
-subtle = "2.5.0"
 
 
 [workspace.lints.rust]
