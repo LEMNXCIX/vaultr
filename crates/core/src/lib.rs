@@ -278,6 +278,17 @@ impl App {
         Ok(env)
     }
 
+    pub fn delete_environment(&self, project_name: &str, env_name: &str) -> Result<(), CoreError> {
+        let project = self
+            .storage
+            .get_project_by_name(project_name)?
+            .ok_or(CoreError::ProjectNotFound)?;
+        if !self.storage.delete_environment(project.id, env_name)? {
+            return Err(CoreError::EnvironmentNotFound);
+        }
+        Ok(())
+    }
+
     /// The default environment of a project.
     pub fn default_environment(&self, project_name: &str) -> Result<Environment, CoreError> {
         let project = self

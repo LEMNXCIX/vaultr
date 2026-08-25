@@ -21,78 +21,125 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    #[command(hide = true, name = "__session-agent")]
-    SessionAgent,
     /// Initialize a new local vault
     Init,
     /// Unlock the vault and store a session (OS keyring, memory if unavailable)
     Unlock,
     /// Clear session (keyring + memory agent)
     Lock,
-    /// Project management
-    #[command(subcommand)]
-    Project(ProjectCmd),
-    /// Environment management
-    #[command(subcommand)]
-    Env(EnvCmd),
-    /// Set or update a variable
-    Set {
-        project: String,
+    /// Show vault status (optionally per-environment)
+    Status {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Create a project (name defaults to the current directory name)
+    Create {
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Extra environment to create besides the default 'local'
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// List projects
+    Projects,
+    /// Remove a project or environment (asks for the master password)
+    Rm {
+        #[command(subcommand)]
+        target: Option<RmTarget>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// List environments of a project, or create one
+    Env {
+        name: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Make an environment the project's default
+    Use {
         env: String,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Set or update a variable in the current project
+    Set {
         key: String,
         value: Option<String>,
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
     },
-    /// Get a variable
+    /// Get a variable (prints its value)
     Get {
-        project: String,
-        env: String,
         key: String,
-        #[arg(long, short)]
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Also copy the value to the clipboard
+        #[arg(short, long)]
         copy: bool,
     },
-    /// Delete a variable
-    #[command(visible_alias = "rm")]
-    Delete {
-        project: String,
-        env: String,
-        key: String,
+    /// List variables of an environment (values masked)
+    Ls {
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
     },
-    /// List variables
-    List { project: String, env: String },
+    /// Delete a variable (asks for the master password)
+    Del {
+        key: String,
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// Search keys across the vault
+    Search {
+        query: String,
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        env: Option<String>,
+    },
+    /// Write .env file for the current project (merges missing keys into existing files)
+    Apply {
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Export as .env
     Export {
-        project: String,
-        env: String,
-        #[arg(long, short)]
+        #[arg(short, long)]
         output: Option<PathBuf>,
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
     },
     /// Import from .env file
     Import {
-        project: String,
         path: PathBuf,
-        /// Target environment (defaults to local)
-        #[arg(long, short, default_value = "local")]
-        env: String,
-    },
-    /// Search keys across all projects
-    Search { query: String },
-    /// Write .env file to path (default: ./.env)
-    Apply {
-        project: String,
-        env: String,
-        #[arg(long, short, default_value = ".env")]
-        path: PathBuf,
+        #[arg(short, long)]
+        env: Option<String>,
+        #[arg(short, long)]
+        project: Option<String>,
     },
     /// Create encrypted backup of the whole vault
-    Backup { path: PathBuf },
+    Backup { path: Option<PathBuf> },
     /// Restore vault from encrypted backup into a new db path
-    Restore {
-        backup: PathBuf,
-        #[arg(long)]
-        target: Option<PathBuf>,
-    },
-    /// Show vault status
-    Status,
+    Restore { backup: PathBuf },
     /// Generate or install shell completions
     Completions {
         /// Shell name (bash, zsh, fish, elvish, powershell) or `install`
@@ -101,28 +148,18 @@ enum Commands {
         #[arg(long)]
         shell: Option<String>,
     },
+    #[command(hide = true, name = "__session-agent")]
+    SessionAgent,
 }
 
 #[derive(Subcommand, Debug)]
-enum ProjectCmd {
-    Create {
-        /// Project name (defaults to the current directory name)
-        name: Option<String>,
-        #[arg(long)]
-        desc: Option<String>,
-        #[arg(long)]
-        color: Option<String>,
-    },
-    List,
-    Delete {
+enum RmTarget {
+    /// Remove an environment from a project
+    Env {
         name: String,
+        #[arg(short, long)]
+        project: Option<String>,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum EnvCmd {
-    List { project: String },
-    Create { project: String, name: String },
 }
 
 fn main() -> Result<()> {
@@ -148,7 +185,7 @@ fn main() -> Result<()> {
             let app = App::open(&db_path)?;
             if app.is_initialized()? {
                 bail!(
-                    "vault already initialized at {}. Create a project with `vltr project create <name>` instead",
+                    "vault already initialized at {}. Create a project with `vltr create` instead",
                     db_path.display()
                 );
             }
@@ -161,6 +198,7 @@ fn main() -> Result<()> {
             app.init(password)?;
             println!("Vault initialized at {}", db_path.display());
             print_session_status();
+            let _ = install_completions(None);
         }
         Commands::Unlock => {
             let mut app = App::open(&db_path)?;
@@ -188,14 +226,69 @@ fn main() -> Result<()> {
             app.lock()?;
             println!("Session cleared.");
         }
-        Commands::Project(ProjectCmd::Create { name, desc, color }) => {
-            let app = open_and_unlock(&db_path)?;
-            let name = project_name(name)?;
-            let project = app.create_project(&name, desc, color, None)?;
-            println!("Created project '{}' (id: {})", project.name, project.id);
-            println!("  → default environment 'local' created");
+        Commands::Status { project, all } => {
+            if project.is_some() && all {
+                bail!("-p and -a are mutually exclusive");
+            }
+            let mut app = App::open(&db_path)?;
+            let initialized = app.is_initialized()?;
+            let info = vltr_core::session::inspect().ok().flatten();
+            if info.is_some() {
+                let _ = app.try_unlock_from_session();
+            }
+            match (&project, all) {
+                (None, false) => {
+                    println!("Database:    {}", db_path.display());
+                    println!("Schema:      v{}", app.schema_version().unwrap_or(0));
+                    println!("Initialized: {}", initialized);
+                    if let Some(info) = info {
+                        let mins = info.remaining_secs / 60;
+                        let rem = info.remaining_secs % 60;
+                        println!(
+                            "Session:     active (~{}m {}s left, {}, refreshes on use)",
+                            mins, rem, info.store
+                        );
+                    } else {
+                        println!("Session:     none");
+                    }
+                    println!("Unlocked:    {}", app.is_unlocked());
+                    println!(
+                        "TTL:         {} minutes (sliding)",
+                        models::constants::SESSION_TTL_SECS / 60
+                    );
+                }
+                (Some(name), false) => {
+                    let name = resolve_project(&app, Some(name.clone()))?;
+                    print_project_status(&app, &name)?;
+                }
+                (_, true) => {
+                    let projects = app.list_projects()?;
+                    if projects.is_empty() {
+                        println!("No projects yet.");
+                    }
+                    for p in projects {
+                        print_project_status(&app, &p.name)?;
+                    }
+                }
+            }
         }
-        Commands::Project(ProjectCmd::List) => {
+        Commands::Create {
+            project,
+            env,
+            desc,
+            color,
+        } => {
+            let app = open_and_unlock(&db_path)?;
+            let name = project_name(project)?;
+            let created = app.create_project(&name, desc, color, None)?;
+            println!("Created project '{}' (id: {})", created.name, created.id);
+            println!("  → default environment 'local' created");
+            if let Some(env) = env {
+                app.create_environment(&created.name, &env)?;
+                println!("  → environment '{}' created", env);
+            }
+        }
+        Commands::Projects => {
             let app = open_and_unlock(&db_path)?;
             let projects = app.list_projects()?;
             if projects.is_empty() {
@@ -206,31 +299,53 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Project(ProjectCmd::Delete { name }) => {
-            let app = open_and_unlock(&db_path)?;
-            app.delete_project(&name)?;
-            println!("Deleted project '{}'", name);
-        }
-        Commands::Env(EnvCmd::List { project }) => {
-            let app = open_and_unlock(&db_path)?;
-            let envs = app.list_environments(&project)?;
-            for e in envs {
-                let marker = if e.is_default { " (default)" } else { "" };
-                println!("• {}{}", e.name, marker);
+        Commands::Rm { target, project } => {
+            let app = open_and_verify(&db_path)?;
+            match target {
+                None => {
+                    let name = project_name(project)?;
+                    app.delete_project(&name)?;
+                    println!("Deleted project '{}'", name);
+                }
+                Some(RmTarget::Env { name, project }) => {
+                    let project = resolve_project(&app, project)?;
+                    app.delete_environment(&project, &name)?;
+                    println!("Deleted environment '{}/{}'", project, name);
+                }
             }
         }
-        Commands::Env(EnvCmd::Create { project, name }) => {
+        Commands::Env { name, project } => {
             let app = open_and_unlock(&db_path)?;
-            app.create_environment(&project, &name)?;
-            println!("Created environment '{}/{}'", project, name);
+            let project = resolve_project(&app, project)?;
+            match name {
+                None => {
+                    let envs = app.list_environments(&project)?;
+                    for e in envs {
+                        let marker = if e.is_default { " (default)" } else { "" };
+                        println!("• {}{}", e.name, marker);
+                    }
+                }
+                Some(env) => {
+                    app.create_environment(&project, &env)?;
+                    println!("Created environment '{}/{}'", project, env);
+                }
+            }
+        }
+        Commands::Use { env, project } => {
+            let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            app.use_environment(&project, &env)?;
+            println!("Default environment for '{}' is now '{}'", project, env);
         }
         Commands::Set {
-            project,
-            env,
             key,
             value,
+            env,
+            project,
         } => {
             let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
             let value = match value {
                 Some(v) => v,
                 None => prompt_secret(&format!("Value for {}=", key))?,
@@ -239,28 +354,26 @@ fn main() -> Result<()> {
             println!("Set {}={} in {}/{}", key, mask(&value), project, env);
         }
         Commands::Get {
-            project,
-            env,
             key,
+            env,
+            project,
             copy,
         } => {
             let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
             let var = app.get_variable(&project, &env, &key)?;
+            println!("{}", var.value);
             if copy {
                 let mut clipboard = arboard::Clipboard::new().context("clipboard")?;
                 clipboard.set_text(&var.value)?;
-                println!("Copied {} to clipboard", key);
-            } else {
-                println!("{}", var.value);
+                eprintln!("Copied {} to clipboard", key);
             }
         }
-        Commands::Delete { project, env, key } => {
+        Commands::Ls { env, project } => {
             let app = open_and_unlock(&db_path)?;
-            app.delete_variable(&project, &env, &key)?;
-            println!("Deleted {}/{}/{}", project, env, key);
-        }
-        Commands::List { project, env } => {
-            let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
             let vars = app.list_variables(&project, &env)?;
             if vars.is_empty() {
                 println!("No variables in {}/{}", project, env);
@@ -270,30 +383,20 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Export {
+        Commands::Del { key, env, project } => {
+            let app = open_and_verify(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
+            app.delete_variable(&project, &env, &key)?;
+            println!("Deleted {}/{}/{}", project, env, key);
+        }
+        Commands::Search {
+            query,
             project,
             env,
-            output,
         } => {
             let app = open_and_unlock(&db_path)?;
-            let content = app.export_env(&project, &env)?;
-            if let Some(path) = output {
-                std::fs::write(&path, &content)?;
-                println!("Wrote {}", path.display());
-            } else {
-                print!("{}", content);
-            }
-        }
-        Commands::Import { project, path, env } => {
-            let app = open_and_unlock(&db_path)?;
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let n = app.import_env(&project, &env, &content)?;
-            println!("Imported {} variables into {}/{}", n, project, env);
-        }
-        Commands::Search { query } => {
-            let app = open_and_unlock(&db_path)?;
-            let hits = app.search(&query, None, None)?;
+            let hits = app.search(&query, project.as_deref(), env.as_deref())?;
             if hits.is_empty() {
                 println!("No matches for '{}'", query);
             } else {
@@ -302,22 +405,51 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project, env, path } => {
+        Commands::Apply {
+            env,
+            project,
+            output,
+        } => {
             let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
+            let path = output.unwrap_or_else(|| PathBuf::from(".env"));
             app.apply_env(&project, &env, &path)?;
             println!("Wrote {}", path.display());
         }
+        Commands::Export {
+            output,
+            env,
+            project,
+        } => {
+            let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
+            let content = app.export_env(&project, &env)?;
+            if let Some(path) = output {
+                std::fs::write(&path, &content)?;
+                println!("Wrote {}", path.display());
+            } else {
+                print!("{}", content);
+            }
+        }
+        Commands::Import { path, env, project } => {
+            let app = open_and_unlock(&db_path)?;
+            let project = resolve_project(&app, project)?;
+            let env = resolve_env(&app, &project, env)?;
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let n = app.import_env(&project, &env, &content)?;
+            println!("Imported {} variables into {}/{}", n, project, env);
+        }
         Commands::Backup { path } => {
+            let path = path.unwrap_or_else(|| default_db_path().with_file_name("vault-backup.enc"));
             let app = open_and_unlock(&db_path)?;
             app.backup(&path)?;
             println!("Backup written to {}", path.display());
         }
-        Commands::Restore { backup, target } => {
-            let target = target.unwrap_or_else(|| {
-                let mut p = db_path.clone();
-                p.set_file_name("vault-restored.db");
-                p
-            });
+        Commands::Restore { backup } => {
+            let target = db_path.with_file_name("vault-restored.db");
             if target.exists() {
                 bail!("Target already exists: {}", target.display());
             }
@@ -327,32 +459,6 @@ fn main() -> Result<()> {
             App::restore(&target, password, &blob)?;
             println!("Restored vault to {}", target.display());
             println!("Use SECRETS_DB or move file to the default path to open it.");
-        }
-        Commands::Status => {
-            let mut app = App::open(&db_path)?;
-            let initialized = app.is_initialized()?;
-            let info = vltr_core::session::inspect().ok().flatten();
-            if info.is_some() {
-                let _ = app.try_unlock_from_session();
-            }
-            println!("Database:    {}", db_path.display());
-            println!("Schema:      v{}", app.schema_version().unwrap_or(0));
-            println!("Initialized: {}", initialized);
-            if let Some(info) = info {
-                let mins = info.remaining_secs / 60;
-                let rem = info.remaining_secs % 60;
-                println!(
-                    "Session:     active (~{}m {}s left, {}, refreshes on use)",
-                    mins, rem, info.store
-                );
-            } else {
-                println!("Session:     none");
-            }
-            println!("Unlocked:    {}", app.is_unlocked());
-            println!(
-                "TTL:         {} minutes (sliding)",
-                models::constants::SESSION_TTL_SECS / 60
-            );
         }
         Commands::Completions { target, shell } => {
             if target == "install" {
@@ -365,6 +471,48 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn resolve_project(app: &App, flag: Option<String>) -> Result<String> {
+    let name = match flag {
+        Some(p) => p,
+        None => current_dir_name()?,
+    };
+    if app.list_projects()?.iter().any(|p| p.name == name) {
+        Ok(name)
+    } else {
+        anyhow::bail!("No project '{name}' in this vault. Run `vltr create -p {name}`.")
+    }
+}
+
+fn resolve_env(app: &App, project: &str, flag: Option<String>) -> Result<String> {
+    match flag {
+        Some(e) => Ok(e),
+        None => Ok(app.default_environment(project)?.name),
+    }
+}
+
+fn current_dir_name() -> Result<String> {
+    std::env::current_dir()?
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .context("could not derive a project name from the current directory")
+}
+
+fn print_project_status(app: &App, name: &str) -> Result<()> {
+    println!("Project '{}':", name);
+    for (e, count) in app.project_status(name)? {
+        let marker = if e.is_default { " (default)" } else { "" };
+        println!(
+            "• {}{} — {} var{}",
+            e.name,
+            marker,
+            count,
+            if count == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
@@ -472,6 +620,18 @@ fn open_and_unlock(db_path: &std::path::Path) -> Result<App> {
     Ok(app)
 }
 
+/// Open the vault and require the master password directly (no session unlock).
+/// Used by destructive commands (`rm`, `del`).
+fn open_and_verify(db_path: &std::path::Path) -> Result<App> {
+    let app = App::open(db_path)?;
+    if !app.is_initialized()? {
+        bail!("Vault not initialized. Run `vltr init` first.");
+    }
+    let password = prompt_password("Master password: ")?;
+    app.verify_password(password)?;
+    Ok(app)
+}
+
 fn print_session_status() {
     match App::session_store().ok().flatten() {
         Some(vltr_core::session::SessionStore::Keyring) => {}
@@ -493,11 +653,7 @@ fn warn_if_session_unavailable() {
 fn project_name(name: Option<String>) -> Result<String> {
     match name.as_deref() {
         Some(value) if value != "." => Ok(value.to_owned()),
-        _ => std::env::current_dir()?
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_owned)
-            .context("could not derive a project name from the current directory"),
+        _ => current_dir_name(),
     }
 }
 

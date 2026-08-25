@@ -263,6 +263,14 @@ impl Storage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn delete_environment(&self, project_id: Id, env_name: &str) -> Result<bool, StorageError> {
+        let n = self.conn.execute(
+            "DELETE FROM environments WHERE project_id = ?1 AND name = ?2",
+            params![project_id.to_string(), env_name],
+        )?;
+        Ok(n > 0)
+    }
+
     // ---------- Variables ----------
 
     pub fn create_variable(&self, var: &Variable) -> Result<(), StorageError> {
@@ -447,6 +455,9 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
 }
 
 pub fn default_db_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SECRETS_DB") {
+        return PathBuf::from(path);
+    }
     use models::constants::{APP_NAME, APP_ORGANIZATION, APP_QUALIFIER};
     let base = directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
         .map(|d| d.data_dir().to_path_buf())
