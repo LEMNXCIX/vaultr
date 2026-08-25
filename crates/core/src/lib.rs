@@ -283,8 +283,18 @@ impl App {
             .storage
             .get_project_by_name(project_name)?
             .ok_or(CoreError::ProjectNotFound)?;
+        let was_default = self
+            .storage
+            .get_environment(project.id, env_name)?
+            .map(|e| e.is_default)
+            .unwrap_or(false);
         if !self.storage.delete_environment(project.id, env_name)? {
             return Err(CoreError::EnvironmentNotFound);
+        }
+        if was_default {
+            if let Some(next) = self.storage.list_environments(project.id)?.first().cloned() {
+                self.storage.set_default_environment(project.id, next.id)?;
+            }
         }
         Ok(())
     }
@@ -565,6 +575,15 @@ mod tests {
             app.get_variable("P", "local", "K"),
             Err(CoreError::VariableNotFound)
         ));
+    }
+
+    #[test]
+    fn delete_default_env_promotes_remaining() {
+        let app = unlocked_app();
+        app.create_project("P", None, None, None).unwrap();
+        let staging = app.create_environment("P", "staging").unwrap();
+        app.delete_environment("P", "local").unwrap();
+        assert_eq!(app.default_environment("P").unwrap().id, staging.id);
     }
 
     #[test]

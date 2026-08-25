@@ -66,14 +66,15 @@ pub fn merge_missing(existing: &str, vars: &[DecryptedVariable]) -> String {
         .filter(|v| !present.contains(&v.key))
         .cloned()
         .collect();
-    if missing.is_empty() {
+    let formatted = format_env(&missing);
+    if formatted.is_empty() {
         return existing.to_string();
     }
     let mut out = existing.to_string();
     if !out.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(&format_env(&missing));
+    out.push_str(&formatted);
     out
 }
 
@@ -124,6 +125,14 @@ mod tests {
         let out = merge_missing("# comment\nA=old\n", &vars);
         assert_eq!(out, "# comment\nA=old\nB=2\n");
         assert_eq!(merge_missing("A=x\nB=y\n", &vars), "A=x\nB=y\n");
+    }
+
+    #[test]
+    fn merge_no_exportable_missing_is_identity() {
+        let mut v = mk_var("C", "3");
+        v.allow_export = false;
+        let out = merge_missing("A=1\n", &[v]);
+        assert_eq!(out, "A=1\n");
     }
 
     #[test]

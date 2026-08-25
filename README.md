@@ -157,6 +157,8 @@ vltr ls
 vltr status
 ```
 
+La variable de entorno `SECRETS_DB` sobreescribe la ruta por defecto de la base de datos del vault.
+
 ## Licencia
 
 MIT OR Apache-2.0
