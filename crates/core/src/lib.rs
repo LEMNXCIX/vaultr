@@ -266,6 +266,25 @@ impl App {
         Ok(env)
     }
 
+    /// The default environment of a project.
+    pub fn default_environment(&self, project_name: &str) -> Result<Environment, CoreError> {
+        let project = self
+            .storage
+            .get_project_by_name(project_name)?
+            .ok_or(CoreError::ProjectNotFound)?;
+        self.storage
+            .get_default_environment(project.id)?
+            .ok_or(CoreError::EnvironmentNotFound)
+    }
+
+    /// Switch the default environment of a project.
+    pub fn use_environment(&self, project_name: &str, env_name: &str) -> Result<(), CoreError> {
+        let (_project, env) = self.resolve_env(project_name, env_name)?;
+        self.storage
+            .set_default_environment(env.project_id, env.id)?;
+        Ok(())
+    }
+
     // ---------- Variables ----------
 
     pub fn set_variable(
@@ -516,6 +535,16 @@ mod tests {
             app.get_variable("P", "local", "BAZ").unwrap().value,
             "hello world"
         );
+    }
+
+    #[test]
+    fn use_environment_switches_default() {
+        let app = unlocked_app();
+        app.create_project("P", None, None, None).unwrap();
+        app.create_environment("P", "staging").unwrap();
+        assert_eq!(app.default_environment("P").unwrap().name, "local");
+        app.use_environment("P", "staging").unwrap();
+        assert_eq!(app.default_environment("P").unwrap().name, "staging");
     }
 
     #[test]

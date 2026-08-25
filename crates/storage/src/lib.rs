@@ -216,6 +216,35 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    pub fn get_default_environment(
+        &self,
+        project_id: Id,
+    ) -> Result<Option<Environment>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at
+                 FROM environments WHERE project_id = ?1 AND is_default = 1 LIMIT 1",
+                params![project_id.to_string()],
+                map_environment,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_default_environment(&self, project_id: Id, env_id: Id) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE environments SET is_default = 0 WHERE project_id = ?1",
+            params![project_id.to_string()],
+        )?;
+        tx.execute(
+            "UPDATE environments SET is_default = 1 WHERE id = ?2 AND project_id = ?1",
+            params![project_id.to_string(), env_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---------- Variables ----------
 
     pub fn create_variable(&self, var: &Variable) -> Result<(), StorageError> {
