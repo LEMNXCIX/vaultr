@@ -483,20 +483,28 @@ impl App {
         Ok(())
     }
 
-    /// Write `.env` file for a project environment.
+    /// Write `.env` file for a project environment. If the file already exists,
+    /// only missing keys are appended (existing content is preserved).
     pub fn apply_env(
         &self,
         project_name: &str,
         env_name: &str,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), CoreError> {
-        let content = self.export_env(project_name, env_name)?;
-        if let Some(parent) = path.as_ref().parent() {
+        let vars = self.list_variables(project_name, env_name)?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        std::fs::write(path.as_ref(), content)?;
+        let content = if path.exists() {
+            let existing = std::fs::read_to_string(path)?;
+            envfile::merge_missing(&existing, &vars)
+        } else {
+            envfile::format_env(&vars)
+        };
+        std::fs::write(path, content)?;
         Ok(())
     }
 }
@@ -561,6 +569,21 @@ mod tests {
             app.get_variable("P", "local", "BAZ").unwrap().value,
             "hello world"
         );
+    }
+
+    #[test]
+    fn apply_merges_missing_keys_into_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = unlocked_app();
+        app.create_project("P", None, None, None).unwrap();
+        app.set_variable("P", "local", "A", "new", None).unwrap();
+        app.set_variable("P", "local", "B", "2", None).unwrap();
+        let out = dir.path().join(".env");
+        std::fs::write(&out, "A=keep\n").unwrap();
+        app.apply_env("P", "local", &out).unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("A=keep"));
+        assert!(content.contains("B=2"));
     }
 
     #[test]

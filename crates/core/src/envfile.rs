@@ -57,6 +57,26 @@ pub fn format_env(vars: &[DecryptedVariable]) -> String {
     }
 }
 
+/// Merge missing keys into existing `.env` content, preserving it byte for byte.
+pub fn merge_missing(existing: &str, vars: &[DecryptedVariable]) -> String {
+    let present: std::collections::HashSet<String> =
+        parse_env(existing).into_iter().map(|(k, _)| k).collect();
+    let missing: Vec<_> = vars
+        .iter()
+        .filter(|v| !present.contains(&v.key))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return existing.to_string();
+    }
+    let mut out = existing.to_string();
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format_env(&missing));
+    out
+}
+
 fn needs_quotes(value: &str) -> bool {
     value.is_empty()
         || value
@@ -84,6 +104,26 @@ mod tests {
             pairs,
             vec![("FOO".into(), "bar baz".into()), ("X".into(), "y".into()),]
         );
+    }
+
+    fn mk_var(key: &str, value: &str) -> DecryptedVariable {
+        DecryptedVariable {
+            id: uuid::Uuid::nil(),
+            environment_id: uuid::Uuid::nil(),
+            key: key.into(),
+            value: value.into(),
+            notes: None,
+            is_readonly: false,
+            allow_export: true,
+        }
+    }
+
+    #[test]
+    fn merge_only_adds_missing_keys() {
+        let vars = vec![mk_var("A", "1"), mk_var("B", "2")];
+        let out = merge_missing("# comment\nA=old\n", &vars);
+        assert_eq!(out, "# comment\nA=old\nB=2\n");
+        assert_eq!(merge_missing("A=x\nB=y\n", &vars), "A=x\nB=y\n");
     }
 
     #[test]
