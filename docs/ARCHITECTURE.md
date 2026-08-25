@@ -25,7 +25,7 @@
           └─────────────────┘
 ```
 
-`crates/sync` es un stub. Solo se activará cuando el MVP local esté sólido.
+`crates/sync` se creará cuando el MVP local esté sólido.
 
 ## Flujo de un secreto
 

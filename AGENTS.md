@@ -26,7 +26,6 @@ crates/
   crypto/   # Argon2id + XChaCha20-Poly1305 + key hierarchy
   storage/  # SQLite + schema + repositorio
   core/     # Use cases / servicios de negocio
-  sync/     # Stub (Supabase futuro)
   cli/      # Binario `vltr` (package `vltr-cli`)
 apps/
   desktop/  # GPUI (fase posterior)
