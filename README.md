@@ -51,6 +51,17 @@ wsl -d archlinux -- vltr status
 wsl -d archlinux -- vltr completions powershell
 ```
 
+Instala completions una sola vez; el comando escribe el script y actualiza el
+perfil del shell detectado. También puedes indicar el shell explícitamente:
+
+```bash
+vltr completions install
+vltr completions install --shell bash
+vltr completions install --shell zsh
+vltr completions install --shell fish
+vltr completions install --shell powershell
+```
+
 `cargo install` sin `--path crates/cli` falla correctamente porque `Cargo.toml`
 en la raíz es un manifiesto virtual de workspace, no un paquete instalable.
 

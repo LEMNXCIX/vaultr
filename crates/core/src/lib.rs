@@ -96,7 +96,7 @@ impl App {
         Ok(())
     }
 
-    /// Unlock using a key already loaded (e.g. from OS keyring).
+    /// Unlock using a key already loaded (e.g. from OS keyring or the memory agent).
     pub fn unlock_with_key(&mut self, key: MasterKey) -> Result<(), CoreError> {
         if !self.storage.is_initialized()? {
             return Err(CoreError::Other("vault not initialized".into()));
@@ -112,7 +112,8 @@ impl App {
         Ok(())
     }
 
-    /// Try to restore session from OS keyring. Returns true if unlocked.
+    /// Try to restore a session from the OS keyring, or the in-memory agent if
+    /// the keyring is unavailable. Returns true if unlocked.
     pub fn try_unlock_from_session(&mut self) -> Result<bool, CoreError> {
         if self.is_unlocked() {
             return Ok(true);
@@ -126,7 +127,7 @@ impl App {
         }
     }
 
-    /// Clear in-memory key and OS keyring session.
+    /// Clear the in-process key and any persisted session (keyring + memory agent).
     pub fn lock(&mut self) -> Result<(), CoreError> {
         self.master_key = None;
         session::clear_session()?;
@@ -135,6 +136,11 @@ impl App {
 
     pub fn has_keyring_session() -> Result<bool, CoreError> {
         session::has_session()
+    }
+
+    /// Where the current session is stored, if any (does not refresh the TTL).
+    pub fn session_store() -> Result<Option<session::SessionStore>, CoreError> {
+        session::active_store()
     }
 
     pub fn is_unlocked(&self) -> bool {

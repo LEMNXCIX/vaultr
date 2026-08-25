@@ -1509,6 +1509,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "crypto",
+ "directories",
+ "getrandom 0.2.15",
  "hex",
  "keyring",
  "models",

@@ -122,7 +122,8 @@ Ver `docs/COMPLETIONS.md`.
 ## Sesión keyring
 
 Tras unlock, la master key se guarda en el OS keyring (`core::session`).  
-`vltr lock` la elimina. Ver `docs/SESSION.md`.
+Si el keyring no está disponible, se usa un agente local en memoria.  
+`vltr lock` elimina ambos. Ver `docs/SESSION.md`.
 
 ## Schema / migraciones
 

@@ -1,5 +1,17 @@
 # Shell completions
 
+## Instalar automáticamente
+
+```bash
+vltr completions install
+# Si el shell no puede detectarse:
+vltr completions install --shell powershell
+```
+
+El instalador guarda el script en la ruta estándar del shell y actualiza
+`.bashrc`, `.zshrc` o el perfil de PowerShell cuando hace falta. Fish y Elvish
+cargan los archivos desde sus directorios estándar.
+
 ## Generar
 
 ```bash

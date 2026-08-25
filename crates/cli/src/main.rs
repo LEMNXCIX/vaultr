@@ -4,6 +4,7 @@ use clap_complete::{generate, Shell};
 use secrecy::SecretString;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 use storage::{default_db_path, migrate_legacy_db};
 use vltr_core::App;
 
@@ -20,11 +21,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(hide = true, name = "__session-agent")]
+    SessionAgent,
     /// Initialize a new local vault
     Init,
-    /// Unlock the vault and store session in OS keyring
+    /// Unlock the vault and store a session (OS keyring, memory if unavailable)
     Unlock,
-    /// Clear session (keyring + memory)
+    /// Clear session (keyring + memory agent)
     Lock,
     /// Project management
     #[command(subcommand)]
@@ -90,8 +93,14 @@ enum Commands {
     },
     /// Show vault status
     Status,
-    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
-    Completions { shell: Shell },
+    /// Generate or install shell completions
+    Completions {
+        /// Shell name (bash, zsh, fish, elvish, powershell) or `install`
+        target: String,
+        /// Shell to configure when target is `install`; detected from $SHELL when omitted
+        #[arg(long)]
+        shell: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -125,12 +134,16 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::SessionAgent) {
+        return vltr_core::session::serve_memory_agent().map_err(Into::into);
+    }
     let db_path = default_db_path();
     if migrate_legacy_db(&db_path)? {
         println!("Migrated vault to {}", db_path.display());
     }
 
     match cli.command {
+        Commands::SessionAgent => unreachable!("handled before opening the vault"),
         Commands::Init => {
             let app = App::open(&db_path)?;
             if app.is_initialized()? {
@@ -147,7 +160,7 @@ fn main() -> Result<()> {
             let mut app = app;
             app.init(password)?;
             println!("Vault initialized at {}", db_path.display());
-            warn_if_session_unavailable();
+            print_session_status();
         }
         Commands::Unlock => {
             let mut app = App::open(&db_path)?;
@@ -156,10 +169,18 @@ fn main() -> Result<()> {
             }
             let password = prompt_password("Master password: ")?;
             app.unlock(password)?;
-            if App::has_keyring_session().unwrap_or(false) {
-                println!("Vault unlocked (session saved in OS keyring).");
-            } else {
-                eprintln!("Vault unlocked, but the OS keyring is unavailable; the password will be requested for future commands.");
+            match App::session_store()? {
+                Some(vltr_core::session::SessionStore::Keyring) => {
+                    println!("Vault unlocked (session saved in OS keyring).");
+                }
+                Some(vltr_core::session::SessionStore::Memory) => {
+                    println!(
+                        "Vault unlocked (OS keyring unavailable; local in-memory session active)."
+                    );
+                }
+                None => {
+                    eprintln!("Vault unlocked, but no session could be started; the password will be requested for future commands.");
+                }
             }
         }
         Commands::Lock => {
@@ -310,20 +331,19 @@ fn main() -> Result<()> {
         Commands::Status => {
             let mut app = App::open(&db_path)?;
             let initialized = app.is_initialized()?;
-            let remaining = vltr_core::session::seconds_remaining().ok().flatten();
-            let session = remaining.is_some();
-            if session {
+            let info = vltr_core::session::inspect().ok().flatten();
+            if info.is_some() {
                 let _ = app.try_unlock_from_session();
             }
             println!("Database:    {}", db_path.display());
             println!("Schema:      v{}", app.schema_version().unwrap_or(0));
             println!("Initialized: {}", initialized);
-            if let Some(secs) = remaining {
-                let mins = secs / 60;
-                let rem = secs % 60;
+            if let Some(info) = info {
+                let mins = info.remaining_secs / 60;
+                let rem = info.remaining_secs % 60;
                 println!(
-                    "Session:     active (~{}m {}s left, refreshes on use)",
-                    mins, rem
+                    "Session:     active (~{}m {}s left, {}, refreshes on use)",
+                    mins, rem, info.store
                 );
             } else {
                 println!("Session:     none");
@@ -334,13 +354,107 @@ fn main() -> Result<()> {
                 models::constants::SESSION_TTL_SECS / 60
             );
         }
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            let name = cmd.get_name().to_string();
-            generate(shell, &mut cmd, name, &mut io::stdout());
+        Commands::Completions { target, shell } => {
+            if target == "install" {
+                install_completions(shell.as_deref())?;
+            } else {
+                let shell = Shell::from_str(&target)
+                    .map_err(|_| anyhow::anyhow!("unsupported shell: {target}"))?;
+                write_completions(shell, &mut io::stdout());
+            }
         }
     }
 
+    Ok(())
+}
+
+fn write_completions(shell: Shell, output: &mut dyn Write) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(shell, &mut cmd, name, output);
+}
+
+fn install_completions(shell: Option<&str>) -> Result<()> {
+    let shell = shell
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("SHELL")
+                .ok()
+                .and_then(|value| value.rsplit('/').next().map(str::to_owned))
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot detect shell; use `vltr completions install --shell <shell>`")
+        })?;
+    let parsed =
+        Shell::from_str(&shell).map_err(|_| anyhow::anyhow!("unsupported shell: {shell}"))?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let path = match parsed {
+        Shell::Bash => home.join(".local/share/bash-completion/completions/vltr"),
+        Shell::Zsh => home.join(".zfunc/_vltr"),
+        Shell::Fish => home.join(".config/fish/completions/vltr.fish"),
+        Shell::Elvish => home.join(".config/elvish/lib/vltr.elv.ts"),
+        Shell::PowerShell => home.join(".config/powershell/Completions/vltr.ps1"),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "automatic installation is not supported for {shell}"
+            ))
+        }
+    };
+    let parent = path.parent().context("completion path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut contents = Vec::new();
+    write_completions(parsed, &mut contents);
+    std::fs::write(&path, contents)?;
+    println!("Installed {shell} completions at {}", path.display());
+    match parsed {
+        Shell::Bash => append_profile_line(
+            &home.join(".bashrc"),
+            "# vaultr completions",
+            &format!("source '{}'", path.display()),
+        )?,
+        Shell::Zsh => append_profile_line(
+            &home.join(".zshrc"),
+            "# vaultr completions",
+            &format!(
+                "fpath=({} $fpath)\nautoload -Uz compinit && compinit",
+                path.parent().unwrap().display()
+            ),
+        )?,
+        Shell::PowerShell => {
+            #[cfg(windows)]
+            let profile = home.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1");
+            #[cfg(not(windows))]
+            let profile = home.join(".config/powershell/Microsoft.PowerShell_profile.ps1");
+            append_profile_line(
+                &profile,
+                "# vaultr completions",
+                &format!(". '{}'", path.display()),
+            )?;
+            println!("Updated PowerShell profile at {}", profile.display());
+        }
+        Shell::Fish | Shell::Elvish => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn append_profile_line(path: &std::path::Path, marker: &str, line: &str) -> Result<()> {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        if contents.contains(marker) {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut profile = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(profile, "\n{marker}\n{line}")?;
+    println!("Updated shell profile at {}", path.display());
     Ok(())
 }
 
@@ -358,10 +472,20 @@ fn open_and_unlock(db_path: &std::path::Path) -> Result<App> {
     Ok(app)
 }
 
+fn print_session_status() {
+    match App::session_store().ok().flatten() {
+        Some(vltr_core::session::SessionStore::Keyring) => {}
+        Some(vltr_core::session::SessionStore::Memory) => {
+            eprintln!("OS keyring is unavailable; using a local in-memory session instead.");
+        }
+        None => warn_if_session_unavailable(),
+    }
+}
+
 fn warn_if_session_unavailable() {
     if !App::has_keyring_session().unwrap_or(false) {
         eprintln!(
-            "Warning: OS keyring session is unavailable; install and run a keyring service to avoid entering the password for each command."
+            "Warning: no session store is available (OS keyring and local agent both failed); the password will be requested for future commands."
         );
     }
 }
