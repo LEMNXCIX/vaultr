@@ -129,7 +129,7 @@ fn parse_header(blob: &[u8]) -> Result<Header, CoreError> {
     })
 }
 
-pub fn open_backup(master_key: &MasterKey, blob: &[u8]) -> Result<VaultSnapshot, CoreError> {
+fn open_backup(master_key: &MasterKey, blob: &[u8]) -> Result<VaultSnapshot, CoreError> {
     let header = parse_header(blob)?;
     if header.body.len() < 25 {
         return Err(CoreError::Other("backup body too small".into()));
