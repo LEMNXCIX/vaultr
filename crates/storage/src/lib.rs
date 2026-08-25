@@ -311,28 +311,10 @@ impl Storage {
         )?;
         let rows = stmt.query_map(params![pattern], |row| {
             Ok(VariableSummary {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                project_id: Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                id: parse_uuid(&row.get::<_, String>(0)?)?,
+                project_id: parse_uuid(&row.get::<_, String>(1)?)?,
                 project_name: row.get(2)?,
-                environment_id: Uuid::parse_str(&row.get::<_, String>(3)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                environment_id: parse_uuid(&row.get::<_, String>(3)?)?,
                 environment_name: row.get(4)?,
                 key: row.get(5)?,
                 notes: row.get(6)?,
