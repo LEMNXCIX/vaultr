@@ -25,9 +25,6 @@ pub const KEYRING_ACCOUNT: &str = "master-key-session";
 /// Sliding session TTL (seconds).
 pub const SESSION_TTL_SECS: u64 = 30 * 60;
 
-/// HKDF info/context for project keys (future sharing).
-pub const PROJECT_KEY_HKDF_INFO: &[u8] = b"secrets-manager-project-key-v1";
-
 /// Backup file format identifiers.
 pub const BACKUP_FILE_MAGIC: &[u8; 16] = b"SECRETSBAK01\0\0\0\0";
 pub const BACKUP_SNAPSHOT_MAGIC: &str = "SECRETS-BACKUP-v1";

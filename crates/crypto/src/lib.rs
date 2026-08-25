@@ -3,13 +3,11 @@
 use aead::{Aead, KeyInit};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use hkdf::Hkdf;
 use models::KdfParams;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
-use sha2::Sha256;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// 32-byte master key, zeroized on drop.
 pub type MasterKey = Zeroizing<[u8; 32]>;
@@ -91,34 +89,9 @@ pub fn decrypt(
     Ok(Zeroizing::new(s))
 }
 
-/// HKDF project key (prepared for future sharing).
-pub fn derive_project_key(
-    master_key: &MasterKey,
-    project_id: &[u8],
-) -> Result<MasterKey, CryptoError> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(models::constants::PROJECT_KEY_HKDF_INFO),
-        master_key.as_ref(),
-    );
-    let mut okm = [0u8; KEY_LEN];
-    hk.expand(project_id, &mut okm)
-        .map_err(|_| CryptoError::InvalidKey)?;
-    Ok(Zeroizing::new(okm))
-}
-
-pub fn secure_zero(data: &mut [u8]) {
-    data.zeroize();
-}
-
-/// Constant-time-ish password confirmation helper for CLI (not crypto-auth).
+/// Password confirmation helper for CLI prompts.
 pub fn passwords_match(a: &SecretString, b: &SecretString) -> bool {
-    use subtle::ConstantTimeEq;
-    let a = a.expose_secret().as_bytes();
-    let b = b.expose_secret().as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    bool::from(a.ct_eq(b))
+    a.expose_secret() == b.expose_secret()
 }
 
 #[cfg(test)]
