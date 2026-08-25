@@ -96,6 +96,18 @@ impl App {
         Ok(())
     }
 
+    /// Verify the master password without opening a session or storing the key.
+    pub fn verify_password(&self, password: SecretString) -> Result<(), CoreError> {
+        let meta = self.storage.get_vault_meta()?;
+        let key = derive_master_key(&password, &meta.salt, &meta.kdf_params)?;
+        let marker = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
+            .map_err(|_| CoreError::InvalidPassword)?;
+        if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
+            return Err(CoreError::InvalidPassword);
+        }
+        Ok(())
+    }
+
     /// Unlock using a key already loaded (e.g. from OS keyring or the memory agent).
     pub fn unlock_with_key(&mut self, key: MasterKey) -> Result<(), CoreError> {
         if !self.storage.is_initialized()? {
@@ -535,6 +547,20 @@ mod tests {
             app.get_variable("P", "local", "BAZ").unwrap().value,
             "hello world"
         );
+    }
+
+    #[test]
+    fn verify_password_rejects_wrong_without_session() {
+        let mut app = unlocked_app();
+        app.lock().unwrap();
+        assert!(!app.is_unlocked());
+        assert!(app
+            .verify_password(SecretString::new("test-password-123".into()))
+            .is_ok());
+        assert!(app
+            .verify_password(SecretString::new("wrong".into()))
+            .is_err());
+        assert!(!app.is_unlocked()); // no abre sesión
     }
 
     #[test]
