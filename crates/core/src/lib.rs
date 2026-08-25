@@ -135,12 +135,12 @@ impl App {
     }
 
     pub fn has_keyring_session() -> Result<bool, CoreError> {
-        session::has_session()
+        Ok(session::inspect()?.is_some())
     }
 
     /// Where the current session is stored, if any (does not refresh the TTL).
     pub fn session_store() -> Result<Option<session::SessionStore>, CoreError> {
-        session::active_store()
+        Ok(session::inspect()?.map(|info| info.store))
     }
 
     pub fn is_unlocked(&self) -> bool {

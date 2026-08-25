@@ -140,15 +140,6 @@ pub fn clear_session() -> Result<(), CoreError> {
     Ok(())
 }
 
-pub fn has_session() -> Result<bool, CoreError> {
-    // Do not refresh TTL when only probing.
-    Ok(inspect()?.is_some())
-}
-
-pub fn active_store() -> Result<Option<SessionStore>, CoreError> {
-    Ok(inspect()?.map(|info| info.store))
-}
-
 /// Inspect the current session without refreshing its TTL.
 pub fn inspect() -> Result<Option<SessionInfo>, CoreError> {
     if let Some(remaining_secs) = keyring_seconds_remaining()? {
