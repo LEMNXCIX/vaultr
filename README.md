@@ -71,20 +71,22 @@ El vault es local y global para tu usuario. Cada repositorio debe tener su
 propio proyecto de Vaultr; al importarlo se crea automáticamente el environment
 `local`.
 
+Sin `-p` se usa el proyecto del directorio actual; sin `-e`, el environment por defecto.
+
 ```bash
 cd ~/Repositories/mi-otro-repo
 
 vltr unlock
-vltr project create                 # usa el nombre del directorio actual
-vltr import mi-otro-repo .env       # usa el environment `local`
-vltr list mi-otro-repo local
+vltr create                         # usa el nombre del directorio actual
+vltr import .env                    # usa el environment `local`
+vltr ls
 ```
 
-`list` enmascara los valores. Para comprobar la importación sin reemplazar el
+`ls` enmascara los valores. Para comprobar la importación sin reemplazar el
 `.env` real, genera un archivo temporal y compáralo sin imprimir secretos:
 
 ```bash
-vltr apply mi-otro-repo local --path /tmp/mi-otro-repo.vaultr.env
+vltr apply -o /tmp/mi-otro-repo.vaultr.env
 cmp --silent .env /tmp/mi-otro-repo.vaultr.env && echo "Import/export correcto"
 ```
 
@@ -92,19 +94,19 @@ Para consultar un valor concreto, ten en cuenta que se imprimirá en la
 terminal:
 
 ```bash
-vltr get mi-otro-repo local NOMBRE_DE_LA_VARIABLE
+vltr get NOMBRE_DE_LA_VARIABLE
 ```
 
 Para importar a otro environment, indícalo explícitamente:
 
 ```bash
-vltr import mi-otro-repo .env --env development
+vltr import .env -e development
 ```
 
 Desde PowerShell, ejecuta los mismos comandos mediante WSL:
 
 ```powershell
-wsl -d archlinux -- bash -lc 'cd ~/Repositories/mi-otro-repo && vltr list mi-otro-repo local'
+wsl -d archlinux -- bash -lc 'cd ~/Repositories/mi-otro-repo && vltr ls'
 ```
 
 Atajos (`Makefile` / cargo aliases):
@@ -146,11 +148,12 @@ vltr completions zsh > ~/.zfunc/_vltr
 
 ```bash
 vltr init
-vltr project create Fudi
-vltr set Fudi local OPENAI_API_KEY sk-...
-vltr get Fudi local OPENAI_API_KEY --copy
-vltr export Fudi local
-vltr list Fudi local
+cd Fudi
+vltr create
+vltr set OPENAI_API_KEY sk-...
+vltr get OPENAI_API_KEY --copy
+vltr export
+vltr ls
 vltr status
 ```
 
