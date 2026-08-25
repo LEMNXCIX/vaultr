@@ -20,7 +20,6 @@ keyring = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
 directories = { workspace = true }
-getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

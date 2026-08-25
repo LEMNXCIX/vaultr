@@ -37,6 +37,11 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
     salt
 }
 
+/// Fill a buffer with cryptographically secure random bytes.
+pub fn fill_random(buf: &mut [u8]) {
+    OsRng.fill_bytes(buf);
+}
+
 /// Derive a 32-byte master key with Argon2id (raw KDF, not PHC string hashing).
 pub fn derive_master_key(
     password: &SecretString,

@@ -22,18 +22,12 @@ pub enum SessionStore {
     Memory,
 }
 
-impl SessionStore {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Keyring => "OS keyring",
-            Self::Memory => "in-memory agent",
-        }
-    }
-}
-
 impl fmt::Display for SessionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(match self {
+            Self::Keyring => "OS keyring",
+            Self::Memory => "in-memory agent",
+        })
     }
 }
 
@@ -151,11 +145,6 @@ pub fn has_session() -> Result<bool, CoreError> {
     Ok(inspect()?.is_some())
 }
 
-/// Seconds remaining in the current session, if any (without refreshing).
-pub fn seconds_remaining() -> Result<Option<u64>, CoreError> {
-    Ok(inspect()?.map(|info| info.remaining_secs))
-}
-
 pub fn active_store() -> Result<Option<SessionStore>, CoreError> {
     Ok(inspect()?.map(|info| info.store))
 }
@@ -266,8 +255,7 @@ fn keyring_seconds_remaining() -> Result<Option<u64>, CoreError> {
 fn start_memory_agent(key: &MasterKey) -> Result<(), CoreError> {
     let _ = stop_memory_agent();
     let mut token = [0u8; 32];
-    getrandom::getrandom(&mut token)
-        .map_err(|e| CoreError::Other(format!("session randomness: {e}")))?;
+    crypto::fill_random(&mut token);
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe)
         .arg("__session-agent")
