@@ -293,7 +293,7 @@ fn main() -> Result<()> {
         }
         Commands::Search { query } => {
             let app = open_and_unlock(&db_path)?;
-            let hits = app.search(&query)?;
+            let hits = app.search(&query, None, None)?;
             if hits.is_empty() {
                 println!("No matches for '{}'", query);
             } else {

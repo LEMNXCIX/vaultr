@@ -245,6 +245,24 @@ impl Storage {
         Ok(())
     }
 
+    /// Environments of a project with their variable counts.
+    pub fn list_environments_with_counts(
+        &self,
+        project_id: Id,
+    ) -> Result<Vec<(Environment, i64)>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.project_id, e.name, e.is_default, e.sort_order, e.created_at, e.updated_at,
+                    COUNT(v.id) AS var_count
+             FROM environments e LEFT JOIN variables v ON v.environment_id = e.id
+             WHERE e.project_id = ?1
+             GROUP BY e.id ORDER BY e.sort_order, e.name",
+        )?;
+        let rows = stmt.query_map(params![project_id.to_string()], |row| {
+            Ok((map_environment(row)?, row.get::<_, i64>(7)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // ---------- Variables ----------
 
     pub fn create_variable(&self, var: &Variable) -> Result<(), StorageError> {
@@ -327,18 +345,36 @@ impl Storage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Search variable keys (and optional notes) across all projects.
-    pub fn search_variables(&self, query: &str) -> Result<Vec<VariableSummary>, StorageError> {
+    /// Search variable keys (and optional notes) across all projects,
+    /// optionally scoped to one project and/or environment by name.
+    pub fn search_variables(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        env: Option<&str>,
+    ) -> Result<Vec<VariableSummary>, StorageError> {
         let pattern = format!("%{}%", query.to_lowercase());
-        let mut stmt = self.conn.prepare(
+        let mut sql = String::from(
             "SELECT v.id, p.id, p.name, e.id, e.name, v.key, v.notes, v.is_readonly, v.allow_export, v.updated_at
              FROM variables v
              JOIN environments e ON e.id = v.environment_id
              JOIN projects p ON p.id = e.project_id
-             WHERE lower(v.key) LIKE ?1 OR lower(COALESCE(v.notes, '')) LIKE ?1
-             ORDER BY p.name, e.name, v.key",
-        )?;
-        let rows = stmt.query_map(params![pattern], |row| {
+             WHERE (lower(v.key) LIKE ?1 OR lower(COALESCE(v.notes, '')) LIKE ?1)",
+        );
+        let project = project.map(str::to_string);
+        let env = env.map(str::to_string);
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&pattern];
+        if let Some(p) = &project {
+            sql.push_str(" AND p.name = ?");
+            params.push(p);
+        }
+        if let Some(e) = &env {
+            sql.push_str(" AND e.name = ?");
+            params.push(e);
+        }
+        sql.push_str(" ORDER BY p.name, e.name, v.key");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
             Ok(VariableSummary {
                 id: parse_uuid(&row.get::<_, String>(0)?)?,
                 project_id: parse_uuid(&row.get::<_, String>(1)?)?,

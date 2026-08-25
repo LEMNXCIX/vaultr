@@ -438,8 +438,22 @@ impl App {
         Ok(count)
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<VariableSummary>, CoreError> {
-        Ok(self.storage.search_variables(query)?)
+    pub fn search(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        env: Option<&str>,
+    ) -> Result<Vec<VariableSummary>, CoreError> {
+        Ok(self.storage.search_variables(query, project, env)?)
+    }
+
+    /// Per-environment variable counts for a project.
+    pub fn project_status(&self, project_name: &str) -> Result<Vec<(Environment, i64)>, CoreError> {
+        let project = self
+            .storage
+            .get_project_by_name(project_name)?
+            .ok_or(CoreError::ProjectNotFound)?;
+        Ok(self.storage.list_environments_with_counts(project.id)?)
     }
 
     /// Write encrypted backup of the entire vault to `path`.
@@ -550,6 +564,19 @@ mod tests {
     }
 
     #[test]
+    fn search_scopes_by_project_and_env() {
+        let app = unlocked_app();
+        app.create_project("A", None, None, None).unwrap();
+        app.create_project("B", None, None, None).unwrap();
+        app.set_variable("A", "local", "K", "1", None).unwrap();
+        app.set_variable("B", "local", "K", "2", None).unwrap();
+        assert_eq!(app.search("k", Some("A"), None).unwrap().len(), 1);
+        let status = app.project_status("A").unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].1, 1); // 1 variable en local
+    }
+
+    #[test]
     fn verify_password_rejects_wrong_without_session() {
         let mut app = unlocked_app();
         app.lock().unwrap();
@@ -579,7 +606,7 @@ mod tests {
         app.create_project("Fudi", None, None, None).unwrap();
         app.set_variable("Fudi", "local", "OPENAI_API_KEY", "x", None)
             .unwrap();
-        let hits = app.search("openai").unwrap();
+        let hits = app.search("openai", None, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].project_name, "Fudi");
         assert_eq!(hits[0].key, "OPENAI_API_KEY");
