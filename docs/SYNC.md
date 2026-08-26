@@ -55,3 +55,21 @@ resuelve con `auth.uid()` y RLS garantiza que solo ves tus filas.
 - Sesiones / keyring.
 - Resolución avanzada de conflictos: gana la versión mayor (`version`),
   último escritor simple.
+
+## Checklist de verificación E2E (manual)
+
+Con tu propio proyecto Supabase:
+
+1. Exporta `VAULTR_SUPABASE_URL` y `VAULTR_SUPABASE_KEY`, y aplica
+   `supabase/migrations/0001_init.sql`.
+2. Dispositivo A: `vltr login && vltr sync` (sube el vault al remoto).
+3. Dispositivo B (o directorio limpio): `vltr bootstrap` + master password →
+   `vltr ls` debe mostrar los secretos.
+4. Edita una variable en B, `vltr sync`; edita la misma en A, `vltr sync` →
+   gana la versión mayor (LWW).
+5. `vltr rm` en B, `vltr sync`, luego `vltr sync` en A → la variable
+   desaparece en A.
+
+Nota sobre deletes: los borrados se propagan como **tombstones**
+(`deleted = true`) y las filas nunca se eliminan físicamente del server; la
+limpieza del lado servidor puede requerir un ciclo extra de sync.
