@@ -43,6 +43,7 @@ pub enum CoreError {
 pub struct App {
     storage: Storage,
     master_key: Option<MasterKey>,
+    last_session_error: Option<String>,
 }
 
 impl App {
@@ -51,6 +52,7 @@ impl App {
         Ok(Self {
             storage,
             master_key: None,
+            last_session_error: None,
         })
     }
 
@@ -59,6 +61,7 @@ impl App {
         Ok(Self {
             storage,
             master_key: None,
+            last_session_error: None,
         })
     }
 
@@ -77,7 +80,7 @@ impl App {
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
             .init_vault(&salt, &params, &verifier_ct, &verifier_nonce)?;
-        let _ = session::save_master_key(&key);
+        self.last_session_error = session::save_master_key(&key).err().map(|e| e.to_string());
         self.master_key = Some(key);
         Ok(())
     }
@@ -91,9 +94,15 @@ impl App {
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
             return Err(CoreError::InvalidPassword);
         }
-        let _ = session::save_master_key(&key);
+        self.last_session_error = session::save_master_key(&key).err().map(|e| e.to_string());
         self.master_key = Some(key);
         Ok(())
+    }
+
+    /// Reason the last `unlock`/`init` failed to persist a session, if any.
+    /// Consumed on read.
+    pub fn take_session_error(&mut self) -> Option<String> {
+        self.last_session_error.take()
     }
 
     /// Verify the master password without opening a session or storing the key.
@@ -142,6 +151,7 @@ impl App {
     /// Clear the in-process key and any persisted session (keyring + memory agent).
     pub fn lock(&mut self) -> Result<(), CoreError> {
         self.master_key = None;
+        self.last_session_error = None;
         session::clear_session()?;
         Ok(())
     }

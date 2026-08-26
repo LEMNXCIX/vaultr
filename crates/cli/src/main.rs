@@ -191,7 +191,7 @@ fn main() -> Result<()> {
             let mut app = app;
             app.init(password)?;
             println!("Vault initialized at {}", db_path.display());
-            print_session_status();
+            print_session_status(&mut app);
             let _ = install_completions(None);
         }
         Commands::Unlock => {
@@ -208,9 +208,14 @@ fn main() -> Result<()> {
                 Some(vltr_core::session::SessionStore::Memory) => {
                     println!("Vault unlocked (OS keyring unavailable; local session file in use).");
                 }
-                None => {
-                    eprintln!("Vault unlocked, but no session could be started; the password will be requested for future commands.");
-                }
+                None => match app.take_session_error() {
+                    Some(reason) => {
+                        eprintln!("Vault unlocked, but no session could be saved ({reason}); the password will be requested for future commands.");
+                    }
+                    None => {
+                        eprintln!("Vault unlocked, but no session could be started; the password will be requested for future commands.");
+                    }
+                },
             }
         }
         Commands::Lock => {
@@ -608,7 +613,7 @@ fn open_and_unlock(db_path: &std::path::Path) -> Result<App> {
     }
     let password = prompt_password("Master password: ")?;
     app.unlock(password)?;
-    warn_if_session_unavailable();
+    warn_if_session_unavailable(&mut app);
     Ok(app)
 }
 
@@ -624,20 +629,22 @@ fn open_and_verify(db_path: &std::path::Path) -> Result<App> {
     Ok(app)
 }
 
-fn print_session_status() {
+fn print_session_status(app: &mut App) {
     match App::session_store().ok().flatten() {
         Some(vltr_core::session::SessionStore::Keyring) => {}
         Some(vltr_core::session::SessionStore::Memory) => {
             eprintln!("OS keyring is unavailable; using a local session file instead.");
         }
-        None => warn_if_session_unavailable(),
+        None => warn_if_session_unavailable(app),
     }
 }
 
-fn warn_if_session_unavailable() {
-    if !App::has_keyring_session().unwrap_or(false) {
+fn warn_if_session_unavailable(app: &mut App) {
+    if let Some(reason) = app.take_session_error() {
+        eprintln!("Warning: no session store could be saved ({reason}); the password will be requested for future commands.");
+    } else if !App::has_keyring_session().unwrap_or(false) {
         eprintln!(
-            "Warning: no session store is available (OS keyring and local agent both failed); the password will be requested for future commands."
+            "Warning: no session store is available; the password will be requested for future commands."
         );
     }
 }
