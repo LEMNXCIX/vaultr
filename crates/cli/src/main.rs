@@ -503,18 +503,14 @@ fn main() -> Result<()> {
                     ),
                     Ok(false) => bail!("no hay vault local; ejecuta `vltr init` primero"),
                     Err(e) => {
-                        eprintln!("Sin conexión con Supabase: {e}");
-                        std::process::exit(1);
+                        bail!("Sin conexión con Supabase: {e}");
                     }
                 }
             }
             let app = open_and_unlock(&db_path)?;
             match block_on(app.sync()) {
                 Ok(report) => println!("Sincronización completada: {report}"),
-                Err(e) => {
-                    eprintln!("Sin conexión con Supabase: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => bail!("Sin conexión con Supabase: {e}"),
             }
         }
         Commands::Completions { target, shell } => {
