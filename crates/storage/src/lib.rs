@@ -26,6 +26,48 @@ pub enum StorageError {
     Other(String),
 }
 
+/// Tables that participate in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTable {
+    Projects,
+    Environments,
+    Variables,
+}
+
+impl SyncTable {
+    fn table_name(self) -> &'static str {
+        match self {
+            SyncTable::Projects => "projects",
+            SyncTable::Environments => "environments",
+            SyncTable::Variables => "variables",
+        }
+    }
+}
+
+/// Key/value store for sync cursors (e.g. `last_pull`), backed by `sync_state`.
+pub struct SyncState;
+
+impl SyncState {
+    pub fn get(conn: &Connection, key: &str) -> Result<Option<String>, StorageError> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set(conn: &Connection, key: &str, value: &str) -> Result<(), StorageError> {
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -146,8 +188,8 @@ impl Storage {
 
     pub fn list_projects(&self) -> Result<Vec<Project>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version
-             FROM projects ORDER BY name",
+            "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version, deleted
+             FROM projects WHERE deleted = 0 ORDER BY name",
         )?;
         let rows = stmt.query_map([], map_project)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -156,8 +198,8 @@ impl Storage {
     pub fn get_project_by_name(&self, name: &str) -> Result<Option<Project>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version
-                 FROM projects WHERE name = ?1",
+                "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version, deleted
+                 FROM projects WHERE name = ?1 AND deleted = 0",
                 params![name],
                 map_project,
             )
@@ -165,10 +207,14 @@ impl Storage {
             .map_err(Into::into)
     }
 
+    /// Soft delete: tombstone the row so sync can propagate it.
     pub fn delete_project(&self, name: &str) -> Result<bool, StorageError> {
-        let n = self
-            .conn
-            .execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+        let n = self.conn.execute(
+            "UPDATE projects
+             SET deleted = 1, updated_at = ?2, version = version + 1
+             WHERE name = ?1 AND deleted = 0",
+            params![name, Utc::now().to_rfc3339()],
+        )?;
         Ok(n > 0)
     }
 
@@ -193,8 +239,8 @@ impl Storage {
 
     pub fn list_environments(&self, project_id: Id) -> Result<Vec<Environment>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at
-             FROM environments WHERE project_id = ?1 ORDER BY sort_order, name",
+            "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at, deleted
+             FROM environments WHERE project_id = ?1 AND deleted = 0 ORDER BY sort_order, name",
         )?;
         let rows = stmt.query_map(params![project_id.to_string()], map_environment)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -207,8 +253,8 @@ impl Storage {
     ) -> Result<Option<Environment>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at
-                 FROM environments WHERE project_id = ?1 AND name = ?2",
+                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at, deleted
+                 FROM environments WHERE project_id = ?1 AND name = ?2 AND deleted = 0",
                 params![project_id.to_string(), env_name],
                 map_environment,
             )
@@ -222,8 +268,8 @@ impl Storage {
     ) -> Result<Option<Environment>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at
-                 FROM environments WHERE project_id = ?1 AND is_default = 1 LIMIT 1",
+                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at, deleted
+                 FROM environments WHERE project_id = ?1 AND is_default = 1 AND deleted = 0 LIMIT 1",
                 params![project_id.to_string()],
                 map_environment,
             )
@@ -251,22 +297,25 @@ impl Storage {
         project_id: Id,
     ) -> Result<Vec<(Environment, i64)>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT e.id, e.project_id, e.name, e.is_default, e.sort_order, e.created_at, e.updated_at,
+            "SELECT e.id, e.project_id, e.name, e.is_default, e.sort_order, e.created_at, e.updated_at, e.deleted,
                     COUNT(v.id) AS var_count
-             FROM environments e LEFT JOIN variables v ON v.environment_id = e.id
-             WHERE e.project_id = ?1
+             FROM environments e LEFT JOIN variables v ON v.environment_id = e.id AND v.deleted = 0
+             WHERE e.project_id = ?1 AND e.deleted = 0
              GROUP BY e.id ORDER BY e.sort_order, e.name",
         )?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
-            Ok((map_environment(row)?, row.get::<_, i64>(7)?))
+            Ok((map_environment(row)?, row.get::<_, i64>(8)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Soft delete: tombstone the row so sync can propagate it.
     pub fn delete_environment(&self, project_id: Id, env_name: &str) -> Result<bool, StorageError> {
         let n = self.conn.execute(
-            "DELETE FROM environments WHERE project_id = ?1 AND name = ?2",
-            params![project_id.to_string(), env_name],
+            "UPDATE environments
+             SET deleted = 1, updated_at = ?3
+             WHERE project_id = ?1 AND name = ?2 AND deleted = 0",
+            params![project_id.to_string(), env_name, Utc::now().to_rfc3339()],
         )?;
         Ok(n > 0)
     }
@@ -306,8 +355,8 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
         let n = self.conn.execute(
             "UPDATE variables SET value_encrypted = ?1, nonce = ?2, notes = COALESCE(?3, notes),
-             updated_at = ?4, version = version + 1
-             WHERE environment_id = ?5 AND key = ?6",
+              updated_at = ?4, version = version + 1
+              WHERE environment_id = ?5 AND key = ?6 AND deleted = 0",
             params![
                 value_encrypted,
                 nonce,
@@ -320,10 +369,13 @@ impl Storage {
         Ok(n > 0)
     }
 
+    /// Soft delete: tombstone the row so sync can propagate it.
     pub fn delete_variable(&self, environment_id: Id, key: &str) -> Result<bool, StorageError> {
         let n = self.conn.execute(
-            "DELETE FROM variables WHERE environment_id = ?1 AND key = ?2",
-            params![environment_id.to_string(), key],
+            "UPDATE variables
+             SET deleted = 1, updated_at = ?3, version = version + 1
+             WHERE environment_id = ?1 AND key = ?2 AND deleted = 0",
+            params![environment_id.to_string(), key, Utc::now().to_rfc3339()],
         )?;
         Ok(n > 0)
     }
@@ -335,8 +387,8 @@ impl Storage {
     ) -> Result<Option<Variable>, StorageError> {
         self.conn
             .query_row(
-                "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version
-                 FROM variables WHERE environment_id = ?1 AND key = ?2",
+                "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+                 FROM variables WHERE environment_id = ?1 AND key = ?2 AND deleted = 0",
                 params![environment_id.to_string(), key],
                 map_variable,
             )
@@ -346,8 +398,8 @@ impl Storage {
 
     pub fn list_variables(&self, environment_id: Id) -> Result<Vec<Variable>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version
-             FROM variables WHERE environment_id = ?1 ORDER BY key",
+            "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+             FROM variables WHERE environment_id = ?1 AND deleted = 0 ORDER BY key",
         )?;
         let rows = stmt.query_map(params![environment_id.to_string()], map_variable)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -365,9 +417,10 @@ impl Storage {
         let mut sql = String::from(
             "SELECT v.id, p.id, p.name, e.id, e.name, v.key, v.notes, v.is_readonly, v.allow_export, v.updated_at
              FROM variables v
-             JOIN environments e ON e.id = v.environment_id
-             JOIN projects p ON p.id = e.project_id
-             WHERE (lower(v.key) LIKE ?1 OR lower(COALESCE(v.notes, '')) LIKE ?1)",
+              JOIN environments e ON e.id = v.environment_id AND e.deleted = 0
+              JOIN projects p ON p.id = e.project_id AND p.deleted = 0
+              WHERE v.deleted = 0
+                AND (lower(v.key) LIKE ?1 OR lower(COALESCE(v.notes, '')) LIKE ?1)",
         );
         let project = project.map(str::to_string);
         let env = env.map(str::to_string);
@@ -398,6 +451,68 @@ impl Storage {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ---------- Sync helpers ----------
+
+    /// Raw connection access for cursor management via [`SyncState`].
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Stamp `synced_at` on the given rows so they leave the dirty set.
+    pub fn mark_synced(
+        &self,
+        table: SyncTable,
+        ids: &[Id],
+        ts: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ts = ts.to_rfc3339();
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!(
+            "UPDATE {} SET synced_at = ?1 WHERE id IN ({})",
+            table.table_name(),
+            placeholders
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&ts];
+        let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        for id in &id_strs {
+            params.push(id);
+        }
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Rows pending push (`synced_at IS NULL OR updated_at > synced_at`).
+    /// Includes tombstoned rows — that is how deletes propagate.
+    pub fn dirty_projects(&self) -> Result<Vec<Project>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version, deleted
+             FROM projects WHERE synced_at IS NULL OR updated_at > synced_at",
+        )?;
+        let rows = stmt.query_map([], map_project)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn dirty_environments(&self) -> Result<Vec<Environment>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at, deleted
+             FROM environments WHERE synced_at IS NULL OR updated_at > synced_at",
+        )?;
+        let rows = stmt.query_map([], map_environment)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn dirty_variables(&self) -> Result<Vec<Variable>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+             FROM variables WHERE synced_at IS NULL OR updated_at > synced_at",
+        )?;
+        let rows = stmt.query_map([], map_variable)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -411,6 +526,7 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         updated_at: parse_dt(&row.get::<_, String>(6)?),
         owner_id: row.get(7)?,
         version: row.get(8)?,
+        deleted: row.get::<_, i32>(9)? != 0,
     })
 }
 
@@ -423,6 +539,7 @@ fn map_environment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Environment> {
         sort_order: row.get(4)?,
         created_at: parse_dt(&row.get::<_, String>(5)?),
         updated_at: parse_dt(&row.get::<_, String>(6)?),
+        deleted: row.get::<_, i32>(7)? != 0,
     })
 }
 
@@ -439,6 +556,7 @@ fn map_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<Variable> {
         created_at: parse_dt(&row.get::<_, String>(8)?),
         updated_at: parse_dt(&row.get::<_, String>(9)?),
         version: row.get(10)?,
+        deleted: row.get::<_, i32>(11)? != 0,
     })
 }
 
@@ -516,6 +634,7 @@ mod tests {
             updated_at: now,
             owner_id: None,
             version: 1,
+            deleted: false,
         };
         s.create_project(&p).unwrap();
         let found = s.get_project_by_name("Fudi").unwrap().unwrap();
@@ -536,5 +655,181 @@ mod tests {
         std::fs::write(&legacy, b"legacy").unwrap();
         assert!(!migrate_vault_path(&legacy, &target).unwrap());
         assert_eq!(std::fs::read(&target).unwrap(), b"vault");
+    }
+
+    fn sample_var(env_id: Id, key: &str) -> Variable {
+        let now = Utc::now();
+        Variable {
+            id: Uuid::now_v7(),
+            environment_id: env_id,
+            key: key.into(),
+            value_encrypted: vec![1, 2, 3],
+            nonce: vec![0; 24],
+            notes: None,
+            is_readonly: false,
+            allow_export: true,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn soft_delete_hides_row_but_keeps_tombstone_dirty() {
+        let s = Storage::open_in_memory().unwrap();
+        let now = Utc::now();
+        let p = Project {
+            id: Uuid::now_v7(),
+            name: "P".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            owner_id: None,
+            version: 1,
+            deleted: false,
+        };
+        s.create_project(&p).unwrap();
+        let e = Environment {
+            id: Uuid::now_v7(),
+            project_id: p.id,
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        s.create_environment(&e).unwrap();
+        let v = sample_var(e.id, "K");
+        s.create_variable(&v).unwrap();
+
+        // Everything visible before delete.
+        assert_eq!(s.list_variables(e.id).unwrap().len(), 1);
+        assert_eq!(s.search_variables("k", None, None).unwrap().len(), 1);
+
+        assert!(s.delete_variable(e.id, "K").unwrap());
+
+        // Hidden from list/get/search after soft delete.
+        assert!(s.list_variables(e.id).unwrap().is_empty());
+        assert!(s.get_variable(e.id, "K").unwrap().is_none());
+        assert!(s.search_variables("k", None, None).unwrap().is_empty());
+
+        // ...but present as a dirty tombstone for sync push.
+        let dirty = s.dirty_variables().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].deleted);
+        assert_eq!(dirty[0].id, v.id);
+        assert_eq!(dirty[0].version, 2);
+
+        // The partial unique index allows recreating the same key.
+        let v2 = sample_var(e.id, "K");
+        s.create_variable(&v2).unwrap();
+        assert_eq!(s.list_variables(e.id).unwrap().len(), 1);
+
+        // mark_synced clears the dirty set.
+        s.mark_synced(SyncTable::Variables, &[v.id, v2.id], Utc::now())
+            .unwrap();
+        assert!(s.dirty_variables().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_and_environment_soft_deletes() {
+        let s = Storage::open_in_memory().unwrap();
+        let now = Utc::now();
+        let p = Project {
+            id: Uuid::now_v7(),
+            name: "P".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            owner_id: None,
+            version: 1,
+            deleted: false,
+        };
+        s.create_project(&p).unwrap();
+        let e = Environment {
+            id: Uuid::now_v7(),
+            project_id: p.id,
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        s.create_environment(&e).unwrap();
+
+        assert!(s.delete_environment(p.id, "local").unwrap());
+        assert!(s.list_environments(p.id).unwrap().is_empty());
+        assert!(s
+            .dirty_environments()
+            .unwrap()
+            .iter()
+            .all(|env| env.deleted));
+
+        assert!(s.delete_project("P").unwrap());
+        assert!(s.list_projects().unwrap().is_empty());
+        assert!(s.get_project_by_name("P").unwrap().is_none());
+        assert_eq!(s.dirty_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_state_roundtrip() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(SyncState::get(s.conn(), "last_pull").unwrap().is_none());
+        SyncState::set(s.conn(), "last_pull", "2026-01-01T00:00:00Z").unwrap();
+        SyncState::set(s.conn(), "last_pull", "2026-02-01T00:00:00Z").unwrap();
+        assert_eq!(
+            SyncState::get(s.conn(), "last_pull").unwrap().as_deref(),
+            Some("2026-02-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn migration_v1_to_v2_preserves_rows() {
+        use crate::migrations::MIGRATIONS;
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO projects (id, name, description, color, icon, created_at, updated_at, owner_id, version)
+             VALUES ('p1', 'Old', NULL, NULL, NULL, ?1, ?1, NULL, 3)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, project_id, name, is_default, sort_order, created_at, updated_at)
+             VALUES ('e1', 'p1', 'local', 1, 0, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO variables (id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version)
+             VALUES ('v1', 'e1', 'KEY', x'0102', x'000000000000000000000000000000000000000000000000', NULL, 0, 1, ?1, ?1, 5)",
+            params![now],
+        )
+        .unwrap();
+
+        migrations::run(&conn).unwrap();
+        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM variables", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM projects WHERE id = 'p1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 3);
     }
 }

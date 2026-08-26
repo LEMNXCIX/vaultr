@@ -58,6 +58,9 @@ pub struct Project {
     /// Reserved for future multi-user support
     pub owner_id: Option<String>,
     pub version: i64,
+    /// Tombstone for sync; deleted rows are hidden locally, kept for push.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +72,9 @@ pub struct Environment {
     pub sort_order: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Tombstone for sync; deleted rows are hidden locally, kept for push.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +93,9 @@ pub struct Variable {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub version: i64,
+    /// Tombstone for sync; deleted rows are hidden locally, kept for push.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// A decrypted view of a variable (used only in memory, never persisted).

@@ -218,6 +218,7 @@ impl App {
             updated_at: now,
             owner_id: None,
             version: 1,
+            deleted: false,
         };
         self.storage.create_project(&project)?;
 
@@ -229,6 +230,7 @@ impl App {
             sort_order: 0,
             created_at: now,
             updated_at: now,
+            deleted: false,
         };
         self.storage.create_environment(&env)?;
         Ok(project)
@@ -283,6 +285,7 @@ impl App {
             sort_order: 10,
             created_at: now,
             updated_at: now,
+            deleted: false,
         };
         self.storage.create_environment(&env)?;
         Ok(env)
@@ -363,6 +366,7 @@ impl App {
                 created_at: existing.created_at,
                 updated_at: now,
                 version: existing.version + 1,
+                deleted: false,
             });
         }
 
@@ -378,6 +382,7 @@ impl App {
             created_at: now,
             updated_at: now,
             version: 1,
+            deleted: false,
         };
         self.storage.create_variable(&var)?;
         Ok(var)

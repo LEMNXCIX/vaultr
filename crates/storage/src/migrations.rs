@@ -5,21 +5,36 @@
 
 use crate::StorageError;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// A single schema migration.
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
     pub sql: &'static str,
+    /// Run with `PRAGMA foreign_keys = OFF` and no runner-managed transaction
+    /// (pragmas are no-ops inside one). The SQL file must manage its own
+    /// BEGIN/COMMIT; the runner verifies `foreign_key_check` afterwards.
+    /// Needed for table rebuilds whose DROP TABLE would otherwise cascade
+    /// into freshly copied rows.
+    pub disable_foreign_keys: bool,
 }
 
 /// Ordered list of all migrations. Append only — never reorder or edit applied SQL.
-pub static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "001_initial",
-    sql: include_str!("../migrations/001_initial.sql"),
-}];
+pub static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "001_initial",
+        sql: include_str!("../migrations/001_initial.sql"),
+        disable_foreign_keys: false,
+    },
+    Migration {
+        version: 2,
+        name: "002_sync_support",
+        sql: include_str!("../migrations/002_sync_support.sql"),
+        disable_foreign_keys: true,
+    },
+];
 
 const BOOTSTRAP: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -43,14 +58,31 @@ pub fn run(conn: &Connection) -> Result<(), StorageError> {
         if is_applied(conn, m.version)? {
             continue;
         }
-        let tx = conn.unchecked_transaction().map_err(StorageError::from)?;
-        tx.execute_batch(m.sql)
-            .map_err(|e| StorageError::Other(format!("migration {} failed: {e}", m.name)))?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            params![m.version, m.name, Utc::now().to_rfc3339()],
-        )?;
-        tx.commit()?;
+        if m.disable_foreign_keys {
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            conn.execute_batch(m.sql)
+                .map_err(|e| StorageError::Other(format!("migration {} failed: {e}", m.name)))?;
+            let violations: Option<i64> = conn
+                .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+                .optional()?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            if violations.is_some() {
+                return Err(StorageError::Other(format!(
+                    "migration {} left foreign key violations",
+                    m.name
+                )));
+            }
+        } else {
+            let tx = conn.unchecked_transaction().map_err(StorageError::from)?;
+            tx.execute_batch(m.sql)
+                .map_err(|e| StorageError::Other(format!("migration {} failed: {e}", m.name)))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                params![m.version, m.name, Utc::now().to_rfc3339()],
+            )?;
+            tx.commit()?;
+        }
+        record(conn, m.version, m.name)?;
         tracing::info!(version = m.version, name = m.name, "applied migration");
     }
     Ok(())
@@ -104,9 +136,10 @@ mod tests {
         run(&conn).unwrap();
         assert!(table_exists(&conn, "projects").unwrap());
         assert!(table_exists(&conn, "variables").unwrap());
+        assert!(table_exists(&conn, "sync_state").unwrap());
         assert!(is_applied(&conn, 1).unwrap());
         // Idempotent
         run(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 1);
+        assert_eq!(current_version(&conn).unwrap(), 2);
     }
 }
