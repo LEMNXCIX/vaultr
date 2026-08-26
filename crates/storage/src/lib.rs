@@ -513,6 +513,147 @@ impl Storage {
         let rows = stmt.query_map([], map_variable)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ---------- Sync merge helpers ----------
+
+    /// Row by id including tombstones (needed to LWW-compare pulled rows).
+    pub fn find_project_by_id(&self, id: Id) -> Result<Option<Project>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, name, description, color, icon, created_at, updated_at, owner_id, version, deleted
+                 FROM projects WHERE id = ?1",
+                params![id.to_string()],
+                map_project,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Row by id including tombstones.
+    pub fn find_environment_by_id(&self, id: Id) -> Result<Option<Environment>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, is_default, sort_order, created_at, updated_at, deleted
+                 FROM environments WHERE id = ?1",
+                params![id.to_string()],
+                map_environment,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Row by id including tombstones.
+    pub fn find_variable_by_id(&self, id: Id) -> Result<Option<Variable>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+                 FROM variables WHERE id = ?1",
+                params![id.to_string()],
+                map_variable,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Insert-or-full-overwrite from a pulled row (LWW winner), tombstones included.
+    pub fn upsert_pulled_project(&self, p: &Project) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO projects (id, name, description, color, icon, created_at, updated_at, owner_id, version, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name, description = excluded.description,
+               color = excluded.color, icon = excluded.icon,
+               updated_at = excluded.updated_at, version = excluded.version,
+               deleted = excluded.deleted",
+            params![
+                p.id.to_string(),
+                p.name,
+                p.description,
+                p.color,
+                p.icon,
+                p.created_at.to_rfc3339(),
+                p.updated_at.to_rfc3339(),
+                p.owner_id,
+                p.version,
+                p.deleted as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert-or-full-overwrite from a pulled row (LWW winner), tombstones included.
+    pub fn upsert_pulled_environment(&self, e: &Environment) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO environments (id, project_id, name, is_default, sort_order, created_at, updated_at, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               project_id = excluded.project_id, name = excluded.name,
+               is_default = excluded.is_default, sort_order = excluded.sort_order,
+               updated_at = excluded.updated_at, deleted = excluded.deleted",
+            params![
+                e.id.to_string(),
+                e.project_id.to_string(),
+                e.name,
+                e.is_default as i32,
+                e.sort_order,
+                e.created_at.to_rfc3339(),
+                e.updated_at.to_rfc3339(),
+                e.deleted as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert-or-full-overwrite from a pulled row (LWW winner), tombstones included.
+    pub fn upsert_pulled_variable(&self, v: &Variable) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO variables
+             (id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+               environment_id = excluded.environment_id, key = excluded.key,
+               value_encrypted = excluded.value_encrypted, nonce = excluded.nonce,
+               notes = excluded.notes, is_readonly = excluded.is_readonly,
+               allow_export = excluded.allow_export, updated_at = excluded.updated_at,
+               version = excluded.version, deleted = excluded.deleted",
+            params![
+                v.id.to_string(),
+                v.environment_id.to_string(),
+                v.key,
+                v.value_encrypted,
+                v.nonce,
+                v.notes,
+                v.is_readonly as i32,
+                v.allow_export as i32,
+                v.created_at.to_rfc3339(),
+                v.updated_at.to_rfc3339(),
+                v.version,
+                v.deleted as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Soft-delete live children of tombstoned parents (projects → environments
+    /// → variables). A tombstoned parent must never leave live children behind,
+    /// locally or on the server. Returns the number of newly tombstoned rows;
+    /// they become dirty and propagate on the next push.
+    pub fn cascade_tombstones(&self, ts: DateTime<Utc>) -> Result<usize, StorageError> {
+        let ts = ts.to_rfc3339();
+        let n_envs = self.conn.execute(
+            "UPDATE environments
+             SET deleted = 1, updated_at = ?1
+             WHERE deleted = 0 AND project_id IN (SELECT id FROM projects WHERE deleted = 1)",
+            params![ts],
+        )?;
+        let n_vars = self.conn.execute(
+            "UPDATE variables
+             SET deleted = 1, version = version + 1, updated_at = ?1
+             WHERE deleted = 0 AND environment_id IN (SELECT id FROM environments WHERE deleted = 1)",
+            params![ts],
+        )?;
+        Ok(n_envs + n_vars)
+    }
 }
 
 fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {

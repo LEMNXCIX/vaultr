@@ -45,6 +45,7 @@ anyhow = "1.0.86"
 # Storage
 rusqlite = { version = "0.31.0", features = ["bundled", "chrono"] }
 chrono = { version = "0.4.38", features = ["serde"] }
+base64 = "0.22.1"
 
 # CLI
 clap = { version = "4.5.7", features = ["derive", "env"] }

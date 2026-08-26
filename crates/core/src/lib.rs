@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub mod backup;
 pub mod envfile;
 pub mod session;
+pub mod sync;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -19,6 +20,10 @@ pub enum CoreError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Crypto(#[from] crypto::CryptoError),
+    #[error(transparent)]
+    Sync(#[from] ::sync::SyncError),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
     #[error("invalid master password")]
     InvalidPassword,
     #[error("vault is locked")]

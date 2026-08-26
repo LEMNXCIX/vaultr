@@ -2,6 +2,7 @@
 //! Column names are snake_case exactly as PostgREST exposes them; blob fields
 //! are base64 TEXT — encoding is the caller's job (core).
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,6 +28,10 @@ pub struct ProjectRow {
     pub deleted: bool,
     #[serde(default = "one")]
     pub version: i64,
+    /// Server-side `updated_at` (timestamptz). Parsed to `DateTime<Utc>`
+    /// before any comparison — never compare raw strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +45,10 @@ pub struct EnvironmentRow {
     pub sort_order: i32,
     #[serde(default)]
     pub deleted: bool,
+    /// Server-side `updated_at` (timestamptz). Parsed to `DateTime<Utc>`
+    /// before any comparison — never compare raw strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -61,6 +70,10 @@ pub struct VariableRow {
     pub deleted: bool,
     #[serde(default = "one")]
     pub version: i64,
+    /// Server-side `updated_at` (timestamptz). Parsed to `DateTime<Utc>`
+    /// before any comparison — never compare raw strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 fn one() -> i64 {
@@ -73,6 +86,7 @@ fn yes() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn variable_row_roundtrip_snake_case() {
@@ -87,12 +101,14 @@ mod tests {
             allow_export: false,
             deleted: false,
             version: 3,
+            updated_at: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(json.contains("\"value_encrypted\""));
         assert!(json.contains("\"environment_id\""));
         assert!(json.contains("\"is_readonly\""));
         assert!(json.contains("\"allow_export\""));
+        assert!(json.contains("\"updated_at\":\"2026-01-01T00:00:00Z\""));
         assert!(!json.contains("valueEncrypted"));
         let back: VariableRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back, row);
@@ -105,6 +121,10 @@ mod tests {
         let row: ProjectRow = serde_json::from_str(minimal).unwrap();
         assert!(!row.deleted);
         assert_eq!(row.version, 1);
+        assert_eq!(
+            row.updated_at,
+            Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
+        );
         let json = serde_json::to_string(&row).unwrap();
         let back: ProjectRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back, row);
