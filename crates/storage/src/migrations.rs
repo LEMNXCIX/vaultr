@@ -60,12 +60,25 @@ pub fn run(conn: &Connection) -> Result<(), StorageError> {
         }
         if m.disable_foreign_keys {
             conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            conn.execute_batch(m.sql)
-                .map_err(|e| StorageError::Other(format!("migration {} failed: {e}", m.name)))?;
-            let violations: Option<i64> = conn
+            let result = conn
+                .execute_batch(m.sql)
+                .and_then(|_| {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                        params![m.version, m.name, Utc::now().to_rfc3339()],
+                    )
+                    .map(|_| ())
+                })
+                .map_err(|e| StorageError::Other(format!("migration {} failed: {e}", m.name)));
+            if result.is_err() {
+                // The failed batch may leave its own transaction open.
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            result?;
+            let violations: Option<String> = conn
                 .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
                 .optional()?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             if violations.is_some() {
                 return Err(StorageError::Other(format!(
                     "migration {} left foreign key violations",
@@ -82,7 +95,6 @@ pub fn run(conn: &Connection) -> Result<(), StorageError> {
             )?;
             tx.commit()?;
         }
-        record(conn, m.version, m.name)?;
         tracing::info!(version = m.version, name = m.name, "applied migration");
     }
     Ok(())
