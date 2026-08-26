@@ -50,11 +50,12 @@ resuelve con `auth.uid()` y RLS garantiza que solo ves tus filas.
 ## Qué NO se sincroniza
 
 - Valores en claro (nunca salen del dispositivo).
-- La master key ni el salt del KDF local (el salt del server en `vaults` es
-  para el flujo de sharing futuro, no para el unlock local).
+- La master key ni el salt del KDF local. Nota: `bootstrap` usa el salt y los
+  `kdf_params` remotos de `vaults` para derivar la clave local; el salt no es
+  confidencial.
 - Sesiones / keyring.
-- Resolución avanzada de conflictos: gana la versión mayor (`version`),
-  último escritor simple.
+- Resolución avanzada de conflictos: LWW por `updated_at` (gana la fila más
+  reciente).
 
 ## Checklist de verificación E2E (manual)
 
@@ -66,7 +67,7 @@ Con tu propio proyecto Supabase:
 3. Dispositivo B (o directorio limpio): `vltr bootstrap` + master password →
    `vltr ls` debe mostrar los secretos.
 4. Edita una variable en B, `vltr sync`; edita la misma en A, `vltr sync` →
-   gana la versión mayor (LWW).
+   gana la edición más reciente (`updated_at`, LWW).
 5. `vltr rm` en B, `vltr sync`, luego `vltr sync` en A → la variable
    desaparece en A.
 

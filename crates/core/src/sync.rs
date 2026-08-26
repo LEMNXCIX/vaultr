@@ -146,9 +146,8 @@ fn sync_client() -> Result<SyncClient, CoreError> {
 
 /// Stored session with refresh if the access token expired.
 async fn fresh_session(client: &SyncClient) -> Result<Session, CoreError> {
-    let stored = load_stored_session()?.ok_or_else(|| {
-        CoreError::Other("not logged in to sync; run 'vltr sync login' first".into())
-    })?;
+    let stored = load_stored_session()?
+        .ok_or_else(|| CoreError::Other("not logged in to sync; run 'vltr login' first".into()))?;
     if stored.saved_at.saturating_add(stored.expires_in) > now_unix() + REFRESH_MARGIN_SECS {
         return Ok(Session {
             access_token: stored.access_token,
@@ -158,7 +157,7 @@ async fn fresh_session(client: &SyncClient) -> Result<Session, CoreError> {
     }
     let refreshed = client.refresh(&stored.refresh_token).await.map_err(|e| {
         CoreError::Other(format!(
-            "session refresh failed ({e}); run 'vltr sync login' again"
+            "session refresh failed ({e}); run 'vltr login' again"
         ))
     })?;
     save_supabase_session(&refreshed)?;
@@ -516,7 +515,7 @@ impl App {
         let prev_cursor = SyncState::get(self.storage.conn(), CURSOR_KEY)?
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc));
-        let since = prev_cursor.map(|c| c.to_rfc3339());
+        let since = prev_cursor.map(|c| c.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
 
         let mut seen: Vec<Option<DateTime<Utc>>> = Vec::new();
 
