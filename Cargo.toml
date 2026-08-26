@@ -5,6 +5,7 @@ members = [
     "crates/crypto",
     "crates/storage",
     "crates/core",
+    "crates/sync",
     "crates/cli",
     # "apps/desktop",  # se activará en la fase de GPUI
 ]
@@ -24,6 +25,7 @@ models = { path = "crates/models" }
 crypto = { path = "crates/crypto" }
 storage = { path = "crates/storage" }
 vltr-core = { path = "crates/core" }
+sync = { path = "crates/sync" }
 
 # Crypto (pinned for Rust 1.75 compatibility)
 argon2 = "0.5.3"
@@ -46,6 +48,9 @@ chrono = { version = "0.4.38", features = ["serde"] }
 
 # CLI
 clap = { version = "4.5.7", features = ["derive", "env"] }
+
+# Sync
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap_complete = "4.5.5"
 arboard = "3.4.0"
 directories = "5.0.1"
