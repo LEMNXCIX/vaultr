@@ -19,8 +19,8 @@ use crate::{App, CoreError};
 use crypto::{derive_master_key, encrypt};
 use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow};
 
-const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
-const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
+pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
+pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
 /// Keyring account holding the Supabase JWT session (service = KEYRING_SERVICE).
 const KEYRING_ACCOUNT_SUPABASE: &str = "supabase-session";
 /// `sync_state` cursor key for incremental pull.
@@ -364,6 +364,19 @@ fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, 
 // ---------- App methods ----------
 
 impl App {
+    /// True when the Supabase env vars are present (sync is configurable).
+    pub fn sync_available_config() -> bool {
+        std::env::var(SUPABASE_URL_ENV).is_ok_and(|v| !v.is_empty())
+            && std::env::var(SUPABASE_KEY_ENV).is_ok_and(|v| !v.is_empty())
+    }
+
+    /// True when a vault exists on the server (requires a stored session).
+    pub async fn remote_has_vault() -> Result<bool, CoreError> {
+        let client = sync_client()?;
+        let session = fresh_session(&client).await?;
+        Ok(client.get_vault(&session).await?.is_some())
+    }
+
     /// Log in to Supabase and persist the JWT session in the OS keyring.
     pub async fn sync_login(&self, email: &str, password: &str) -> Result<(), CoreError> {
         let client = sync_client()?;

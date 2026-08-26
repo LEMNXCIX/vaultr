@@ -52,6 +52,7 @@ clap = { version = "4.5.7", features = ["derive", "env"] }
 
 # Sync
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt"] }
 clap_complete = "4.5.5"
 arboard = "3.4.0"
 directories = "5.0.1"

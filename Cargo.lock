@@ -2158,6 +2158,7 @@ dependencies = [
  "rpassword",
  "secrecy",
  "storage",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "vltr-core",

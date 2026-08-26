@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -140,6 +140,14 @@ enum Commands {
     Backup { path: Option<PathBuf> },
     /// Restore vault from encrypted backup into a new db path
     Restore { backup: PathBuf },
+    /// Log in to Supabase sync (see docs/SYNC.md for required env vars)
+    Login,
+    /// Close the Supabase sync session
+    Logout,
+    /// Initialize this device's vault from the remote vault
+    Bootstrap,
+    /// Sync local changes with the remote (Supabase)
+    Sync,
     /// Generate or install shell completions
     Completions {
         /// Shell name (bash, zsh, fish, elvish, powershell) or `install`
@@ -457,6 +465,58 @@ fn main() -> Result<()> {
             println!("Restored vault to {}", target.display());
             println!("Use SECRETS_DB or move file to the default path to open it.");
         }
+        Commands::Login => {
+            require_sync_config()?;
+            let app = App::open(&db_path)?;
+            let email = prompt_line("Email: ")?;
+            let password = prompt_password("Contraseña: ")?;
+            block_on(app.sync_login(&email, password.expose_secret()))?;
+            println!("Sesión de sincronización iniciada para {email}");
+        }
+        Commands::Logout => {
+            require_sync_config()?;
+            let app = App::open(&db_path)?;
+            app.sync_logout()?;
+            println!("Sesión de sincronización cerrada.");
+        }
+        Commands::Bootstrap => {
+            require_sync_config()?;
+            let mut app = App::open(&db_path)?;
+            if app.is_initialized()? {
+                bail!("este dispositivo ya tiene un vault; usa `vltr sync`");
+            }
+            let password = prompt_password("Master password: ")?;
+            let confirm = prompt_password("Confirm master password: ")?;
+            if !crypto::passwords_match(&password, &confirm) {
+                bail!("Passwords do not match");
+            }
+            block_on(app.bootstrap_from_remote(password))?;
+            println!("Vault inicializado desde el remoto. Ya puedes usar `vltr sync`.");
+        }
+        Commands::Sync => {
+            require_sync_config()?;
+            let app = App::open(&db_path)?;
+            if !app.is_initialized()? {
+                match block_on(App::remote_has_vault()) {
+                    Ok(true) => bail!(
+                        "este dispositivo no tiene vault pero el remoto sí; usa `vltr bootstrap`"
+                    ),
+                    Ok(false) => bail!("no hay vault local; ejecuta `vltr init` primero"),
+                    Err(e) => {
+                        eprintln!("Sin conexión con Supabase: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let app = open_and_unlock(&db_path)?;
+            match block_on(app.sync()) {
+                Ok(report) => println!("Sincronización completada: {report}"),
+                Err(e) => {
+                    eprintln!("Sin conexión con Supabase: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Completions { target, shell } => {
             if target == "install" {
                 install_completions(shell.as_deref())?;
@@ -469,6 +529,33 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn require_sync_config() -> Result<()> {
+    if !App::sync_available_config() {
+        bail!(
+            "Sync no configurado: define {} y {} (ver docs/SYNC.md)",
+            vltr_core::sync::SUPABASE_URL_ENV,
+            vltr_core::sync::SUPABASE_KEY_ENV
+        );
+    }
+    Ok(())
+}
+
+fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(fut)
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt} ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 fn resolve_project(app: &App, flag: Option<String>) -> Result<String> {
