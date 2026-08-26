@@ -25,7 +25,7 @@ enum Commands {
     Init,
     /// Unlock the vault and store a session (OS keyring, memory if unavailable)
     Unlock,
-    /// Clear session (keyring + memory agent)
+    /// Clear session (keyring + session file)
     Lock,
     /// Show vault status (optionally per-environment)
     Status {
@@ -148,8 +148,6 @@ enum Commands {
         #[arg(long)]
         shell: Option<String>,
     },
-    #[command(hide = true, name = "__session-agent")]
-    SessionAgent,
 }
 
 #[derive(Subcommand, Debug)]
@@ -171,16 +169,12 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if matches!(cli.command, Commands::SessionAgent) {
-        return vltr_core::session::serve_memory_agent().map_err(Into::into);
-    }
     let db_path = default_db_path();
     if migrate_legacy_db(&db_path)? {
         println!("Migrated vault to {}", db_path.display());
     }
 
     match cli.command {
-        Commands::SessionAgent => unreachable!("handled before opening the vault"),
         Commands::Init => {
             let app = App::open(&db_path)?;
             if app.is_initialized()? {
@@ -212,9 +206,7 @@ fn main() -> Result<()> {
                     println!("Vault unlocked (session saved in OS keyring).");
                 }
                 Some(vltr_core::session::SessionStore::Memory) => {
-                    println!(
-                        "Vault unlocked (OS keyring unavailable; local in-memory session active)."
-                    );
+                    println!("Vault unlocked (OS keyring unavailable; local session file in use).");
                 }
                 None => {
                     eprintln!("Vault unlocked, but no session could be started; the password will be requested for future commands.");
@@ -636,7 +628,7 @@ fn print_session_status() {
     match App::session_store().ok().flatten() {
         Some(vltr_core::session::SessionStore::Keyring) => {}
         Some(vltr_core::session::SessionStore::Memory) => {
-            eprintln!("OS keyring is unavailable; using a local in-memory session instead.");
+            eprintln!("OS keyring is unavailable; using a local session file instead.");
         }
         None => warn_if_session_unavailable(),
     }

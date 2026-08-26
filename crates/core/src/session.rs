@@ -1,4 +1,4 @@
-//! Session store for the master key: OS keyring first, in-memory agent fallback.
+//! Session store for the master key: OS keyring first, 0600 local session file fallback.
 //! Sliding 30-minute TTL in both backends.
 
 use crate::CoreError;
@@ -6,10 +6,7 @@ use crypto::MasterKey;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
@@ -26,7 +23,7 @@ impl fmt::Display for SessionStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Keyring => "OS keyring",
-            Self::Memory => "in-memory agent",
+            Self::Memory => "local session file",
         })
     }
 }
@@ -43,13 +40,6 @@ struct SessionPayload {
     /// Hex-encoded 32-byte master key.
     key_hex: String,
     /// Unix timestamp (seconds) when the session expires.
-    expires_at: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AgentDescriptor {
-    port: u16,
-    token_hex: String,
     expires_at: u64,
 }
 
@@ -89,40 +79,106 @@ fn decode_key(key_hex: &str) -> Option<MasterKey> {
     Some(Zeroizing::new(arr))
 }
 
-fn agent_path() -> Result<std::path::PathBuf, CoreError> {
+/// Path of the fallback session file. Overridable via `VLTR_SESSION_FILE`
+/// (tests and debugging).
+fn session_file_path() -> Result<std::path::PathBuf, CoreError> {
+    if let Some(path) = std::env::var_os("VLTR_SESSION_FILE") {
+        return Ok(std::path::PathBuf::from(path));
+    }
     let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")
-        .map(|dirs| dirs.data_dir().to_path_buf())
+        .map(|d| d.data_dir().to_path_buf())
         .ok_or_else(|| CoreError::Other("cannot determine Vaultr data directory".into()))?;
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("session-agent.json"))
+    Ok(dir.join("session.json"))
+}
+
+fn save_memory_file(key: &MasterKey) -> Result<(), CoreError> {
+    let path = session_file_path()?;
+    let json = serde_json::to_string(&build_payload(key))
+        .map_err(|e| CoreError::Other(format!("serialize session: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(json.as_bytes())?;
+        // ponytail: chmod tras crear cubre filesystems que ignoran mode() en create
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, json)?; // Windows: ACLs fuera de scope del MVP
+    Ok(())
+}
+
+/// Read the session file. Expired or corrupt → delete it and return None.
+/// Valid → refresh the sliding TTL before returning the key.
+fn load_memory_file() -> Result<Option<MasterKey>, CoreError> {
+    let path = session_file_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let payload: SessionPayload = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+    if payload_seconds_remaining(&payload).is_none() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+    let Some(key) = decode_key(&payload.key_hex) else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    };
+    // Sliding TTL: extend on every successful use.
+    let _ = save_memory_file(&key);
+    Ok(Some(key))
+}
+
+fn memory_seconds_remaining() -> Result<Option<u64>, CoreError> {
+    let path = session_file_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match serde_json::from_str::<SessionPayload>(&raw) {
+        Ok(payload) => match payload_seconds_remaining(&payload) {
+            Some(secs) => Ok(Some(secs)),
+            None => {
+                let _ = std::fs::remove_file(&path);
+                Ok(None)
+            }
+        },
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            Ok(None)
+        }
+    }
+}
+
+fn stop_memory_file() -> Result<(), CoreError> {
+    let _ = std::fs::remove_file(session_file_path()?);
+    Ok(())
 }
 
 /// Persist the master key with a fresh 30-minute TTL.
-/// Prefers the OS keyring; starts the local memory agent if the keyring is unavailable.
+/// Prefers the OS keyring; falls back to a 0600 session file next to the vault data.
 pub fn save_master_key(key: &MasterKey) -> Result<SessionStore, CoreError> {
     if save_keyring(key) {
-        let _ = stop_memory_agent();
+        let _ = stop_memory_file();
         return Ok(SessionStore::Keyring);
     }
-    // The agent is a hidden subcommand of the `vltr` binary. Skip it from
-    // unit-test harnesses so we do not spawn leftover processes.
-    if !is_cli_binary() {
-        return Err(CoreError::Other(
-            "OS keyring unavailable and memory agent requires the vltr binary".into(),
-        ));
-    }
-    start_memory_agent(key)?;
+    save_memory_file(key)?;
     Ok(SessionStore::Memory)
-}
-
-fn is_cli_binary() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .is_some_and(|name| name == "vltr")
 }
 
 /// Load the master key if a session exists and is not expired.
@@ -131,12 +187,12 @@ pub fn load_master_key() -> Result<Option<MasterKey>, CoreError> {
     if let Some(key) = load_keyring()? {
         return Ok(Some(key));
     }
-    load_memory_agent()
+    load_memory_file()
 }
 
 pub fn clear_session() -> Result<(), CoreError> {
     let _ = clear_keyring();
-    let _ = stop_memory_agent();
+    let _ = stop_memory_file();
     Ok(())
 }
 
@@ -243,152 +299,6 @@ fn keyring_seconds_remaining() -> Result<Option<u64>, CoreError> {
     Ok(payload_seconds_remaining(&payload))
 }
 
-fn start_memory_agent(key: &MasterKey) -> Result<(), CoreError> {
-    let _ = stop_memory_agent();
-    let mut token = [0u8; 32];
-    crypto::fill_random(&mut token);
-    let exe = std::env::current_exe()?;
-    let mut child = Command::new(exe)
-        .arg("__session-agent")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| CoreError::Other("agent stdin unavailable".into()))?;
-    stdin.write_all(&token)?;
-    stdin.write_all(key.as_ref())?;
-    drop(stdin);
-    for _ in 0..20 {
-        if read_agent_descriptor()?.is_some() {
-            return Ok(());
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Err(CoreError::Other("session agent did not start".into()))
-}
-
-pub fn serve_memory_agent() -> Result<(), CoreError> {
-    let mut bootstrap = Zeroizing::new([0u8; 64]);
-    std::io::stdin().read_exact(&mut *bootstrap)?;
-    let token = &bootstrap[..32];
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&bootstrap[32..]);
-    let key = Zeroizing::new(key_bytes);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    listener.set_nonblocking(true)?;
-    let mut descriptor = AgentDescriptor {
-        port: listener.local_addr()?.port(),
-        token_hex: hex::encode(token),
-        expires_at: now_unix().saturating_add(SESSION_TTL_SECS),
-    };
-    write_agent_descriptor(&descriptor)?;
-    loop {
-        if now_unix() >= descriptor.expires_at {
-            break;
-        }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut request = [0u8; 33];
-                if stream.read_exact(&mut request).is_ok() && request[..32] == *token {
-                    if request[32] == 1 {
-                        let _ = stream.write_all(b"OK");
-                        break;
-                    }
-                    let _ = stream.write_all(key.as_ref());
-                    descriptor.expires_at = now_unix().saturating_add(SESSION_TTL_SECS);
-                    write_agent_descriptor(&descriptor)?;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let _ = std::fs::remove_file(agent_path()?);
-    Ok(())
-}
-
-fn read_agent_descriptor() -> Result<Option<AgentDescriptor>, CoreError> {
-    let path = agent_path()?;
-    match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(serde_json::from_str(&raw).ok()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn write_agent_descriptor(descriptor: &AgentDescriptor) -> Result<(), CoreError> {
-    let path = agent_path()?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(&serde_json::to_vec(descriptor).map_err(|e| CoreError::Other(e.to_string()))?)?;
-    Ok(())
-}
-
-fn load_memory_agent() -> Result<Option<MasterKey>, CoreError> {
-    let Some(descriptor) = read_agent_descriptor()? else {
-        return Ok(None);
-    };
-    if now_unix() >= descriptor.expires_at {
-        let _ = std::fs::remove_file(agent_path()?);
-        return Ok(None);
-    }
-    let token = match hex::decode(descriptor.token_hex) {
-        Ok(value) if value.len() == 32 => value,
-        _ => return Ok(None),
-    };
-    let mut stream = match TcpStream::connect_timeout(
-        &(std::net::Ipv4Addr::LOCALHOST, descriptor.port).into(),
-        std::time::Duration::from_millis(200),
-    ) {
-        Ok(stream) => stream,
-        Err(_) => return Ok(None),
-    };
-    stream.write_all(&token)?;
-    stream.write_all(&[0])?;
-    let mut bytes = [0u8; 32];
-    if stream.read_exact(&mut bytes).is_err() {
-        return Ok(None);
-    }
-    Ok(Some(Zeroizing::new(bytes)))
-}
-
-fn memory_seconds_remaining() -> Result<Option<u64>, CoreError> {
-    if let Some(descriptor) = read_agent_descriptor()? {
-        let now = now_unix();
-        if now < descriptor.expires_at {
-            return Ok(Some(descriptor.expires_at - now));
-        }
-        let _ = std::fs::remove_file(agent_path()?);
-    }
-    Ok(None)
-}
-
-fn stop_memory_agent() -> Result<(), CoreError> {
-    if let Some(descriptor) = read_agent_descriptor()? {
-        if let Ok(token) = hex::decode(descriptor.token_hex) {
-            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", descriptor.port)) {
-                let _ = stream.write_all(&token);
-                let _ = stream.write_all(&[1]);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(agent_path()?);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +326,41 @@ mod tests {
     fn decode_key_rejects_wrong_length() {
         assert!(decode_key("00").is_none());
         assert!(decode_key(&"00".repeat(32)).is_some());
+    }
+
+    #[test]
+    fn memory_file_roundtrip_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::env::set_var("VLTR_SESSION_FILE", &path);
+
+        let key = decode_key(&"ab".repeat(32)).unwrap();
+        save_memory_file(&key).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "session file must be 0600");
+        }
+
+        let loaded = load_memory_file().unwrap().expect("roundtrip works");
+        assert_eq!(loaded.as_ref(), key.as_ref());
+
+        // Expired payload → load returns None and deletes the file.
+        let expired = SessionPayload {
+            key_hex: "ab".repeat(32),
+            expires_at: now_unix().saturating_sub(1),
+        };
+        std::fs::write(&path, serde_json::to_string(&expired).unwrap()).unwrap();
+        assert!(load_memory_file().unwrap().is_none());
+        assert!(!path.exists(), "expired session file must be deleted");
+
+        // stop removes any leftover file.
+        save_memory_file(&key).unwrap();
+        stop_memory_file().unwrap();
+        assert!(!path.exists());
+
+        std::env::remove_var("VLTR_SESSION_FILE");
     }
 }
