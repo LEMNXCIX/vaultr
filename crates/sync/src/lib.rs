@@ -114,23 +114,9 @@ impl SyncClient {
         let mut out = Vec::new();
         let mut offset: u32 = 0;
         loop {
-            let to = offset + PAGE_SIZE - 1;
-            let mut url = format!(
-                "{}/rest/v1/{table}?select=*&order=updated_at.asc",
-                self.base_url
-            );
-            if let Some(since) = since {
-                url.push_str(&format!("&updated_at=gt.{since}"));
-            }
-            let resp = self
-                .http
-                .get(&url)
-                .header("Range", format!("{offset}-{to}"))
-                .bearer_auth(&session.access_token)
-                .header("apikey", &self.anon_key)
-                .send()
+            let page = self
+                .pull_page_at::<T>(session, table, since, offset)
                 .await?;
-            let page: Vec<T> = self.parse_rest(resp).await?;
             let short = page.len() < PAGE_SIZE as usize;
             out.extend(page);
             if short {
@@ -139,6 +125,43 @@ impl SyncClient {
             offset += PAGE_SIZE;
         }
         Ok(out)
+    }
+
+    /// First page only (up to PAGE_SIZE rows, oldest first). Used where the
+    /// full table is unnecessary, e.g. sampling a ciphertext to verify a
+    /// password during bootstrap.
+    pub async fn pull_page<T: DeserializeOwned>(
+        &self,
+        session: &Session,
+        table: &str,
+    ) -> Result<Vec<T>> {
+        self.pull_page_at(session, table, None, 0).await
+    }
+
+    async fn pull_page_at<T: DeserializeOwned>(
+        &self,
+        session: &Session,
+        table: &str,
+        since: Option<&str>,
+        offset: u32,
+    ) -> Result<Vec<T>> {
+        let to = offset + PAGE_SIZE - 1;
+        let mut url = format!(
+            "{}/rest/v1/{table}?select=*&order=updated_at.asc",
+            self.base_url
+        );
+        if let Some(since) = since {
+            url.push_str(&format!("&updated_at=gt.{since}"));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .header("Range", format!("{offset}-{to}"))
+            .bearer_auth(&session.access_token)
+            .header("apikey", &self.anon_key)
+            .send()
+            .await?;
+        self.parse_rest(resp).await
     }
 
     async fn post_upsert<T: Serialize>(

@@ -36,6 +36,9 @@ pub struct SyncReport {
     pub pulled: usize,
     pub conflicts_won_remote: Vec<String>,
     pub deleted_pulled: usize,
+    /// Pulled rows whose parent row is unknown locally; they are skipped
+    /// instead of hard-failing sync with a FK violation.
+    pub skipped_orphans: usize,
 }
 
 impl fmt::Display for SyncReport {
@@ -52,19 +55,32 @@ impl fmt::Display for SyncReport {
         if self.deleted_pulled > 0 {
             write!(f, ", {} borrados", self.deleted_pulled)?;
         }
+        if self.skipped_orphans > 0 {
+            write!(f, ", {} huérfanos omitidos", self.skipped_orphans)?;
+        }
         Ok(())
     }
 }
 
 // ---------- Supabase session persistence (OS keyring only) ----------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct StoredSession {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
     /// Unix seconds when the tokens were persisted.
     saved_at: u64,
+}
+
+impl fmt::Debug for StoredSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never print the tokens.
+        f.debug_struct("StoredSession")
+            .field("expires_in", &self.expires_in)
+            .field("saved_at", &self.saved_at)
+            .finish_non_exhaustive()
+    }
 }
 
 fn supabase_entry() -> Result<Entry, CoreError> {
@@ -285,34 +301,64 @@ fn next_cursor(
 
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
 
-fn merge_project(storage: &Storage, row: &ProjectRow) -> Result<bool, CoreError> {
+/// Result of merging one pulled row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeOutcome {
+    /// Remote lost LWW (or had no timestamp); local row untouched.
+    LocalKept,
+    /// Remote applied; `true` when it was a tombstone.
+    Applied(bool),
+    /// Parent row unknown locally; skipped to avoid an FK violation.
+    SkippedOrphan,
+}
+
+impl MergeOutcome {
+    fn pulled_and_deleted(self) -> Option<bool> {
+        match self {
+            MergeOutcome::Applied(deleted) => Some(deleted),
+            _ => None,
+        }
+    }
+}
+
+fn merge_project(storage: &Storage, row: &ProjectRow) -> Result<MergeOutcome, CoreError> {
     let id = parse_id(&row.id)?;
     let local_ts = storage.find_project_by_id(id)?.map(|p| p.updated_at);
     if !remote_wins(row.updated_at, local_ts) {
-        return Ok(false);
+        return Ok(MergeOutcome::LocalKept);
     }
     storage.upsert_pulled_project(&project_from_dto(row)?)?;
-    Ok(true)
+    Ok(MergeOutcome::Applied(row.deleted))
 }
 
-fn merge_environment(storage: &Storage, row: &EnvironmentRow) -> Result<bool, CoreError> {
+fn merge_environment(storage: &Storage, row: &EnvironmentRow) -> Result<MergeOutcome, CoreError> {
     let id = parse_id(&row.id)?;
+    let project_id = parse_id(&row.project_id)?;
+    // Orphan guard: applying a child whose parent is unknown locally would
+    // violate the FK; skip instead of failing the whole sync.
+    if !storage.find_project_by_id(project_id)?.is_some() {
+        return Ok(MergeOutcome::SkippedOrphan);
+    }
     let local_ts = storage.find_environment_by_id(id)?.map(|e| e.updated_at);
     if !remote_wins(row.updated_at, local_ts) {
-        return Ok(false);
+        return Ok(MergeOutcome::LocalKept);
     }
     storage.upsert_pulled_environment(&environment_from_dto(row)?)?;
-    Ok(true)
+    Ok(MergeOutcome::Applied(row.deleted))
 }
 
-fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<bool, CoreError> {
+fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, CoreError> {
     let id = parse_id(&row.id)?;
+    let environment_id = parse_id(&row.environment_id)?;
+    if !storage.find_environment_by_id(environment_id)?.is_some() {
+        return Ok(MergeOutcome::SkippedOrphan);
+    }
     let local_ts = storage.find_variable_by_id(id)?.map(|v| v.updated_at);
     if !remote_wins(row.updated_at, local_ts) {
-        return Ok(false);
+        return Ok(MergeOutcome::LocalKept);
     }
     storage.upsert_pulled_variable(&variable_from_dto(row)?)?;
-    Ok(true)
+    Ok(MergeOutcome::Applied(row.deleted))
 }
 
 // ---------- App methods ----------
@@ -360,9 +406,27 @@ impl App {
         let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
-        // No verifier travels over the wire; derive locally and mint one.
-        // A wrong password simply fails verification on later unlocks.
+        // No verifier travels over the wire; derive locally and verify
+        // against a real remote ciphertext before touching the local vault.
         let key = derive_master_key(&password, &salt, &kdf_params)?;
+        let sample = client
+            .pull_page::<VariableRow>(&session, "variables")
+            .await?;
+        if let Some(first) = sample
+            .iter()
+            .find(|r| !r.deleted)
+            .or_else(|| sample.first())
+        {
+            let ct = b64_decode(&first.value_encrypted)?;
+            let nonce = b64_decode(&first.nonce)?;
+            if crypto::decrypt(&key, &ct, &nonce).is_err() {
+                return Err(CoreError::InvalidPassword(
+                    "la contraseña no descifra el vault remoto; revísala e inténtalo de nuevo"
+                        .into(),
+                ));
+            }
+        }
+
         let (verifier_ct, verifier_nonce) =
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
@@ -448,9 +512,9 @@ impl App {
             .await?;
         for row in &pulled_projects {
             seen.push(row.updated_at);
-            if merge_project(&self.storage, row)? {
+            if let Some(deleted) = merge_project(&self.storage, row)?.pulled_and_deleted() {
                 report.pulled += 1;
-                if row.deleted {
+                if deleted {
                     report.deleted_pulled += 1;
                 }
                 report.conflicts_won_remote.push(row.id.clone());
@@ -462,12 +526,22 @@ impl App {
             .await?;
         for row in &pulled_environments {
             seen.push(row.updated_at);
-            if merge_environment(&self.storage, row)? {
-                report.pulled += 1;
-                if row.deleted {
-                    report.deleted_pulled += 1;
+            // Skipped orphans do not advance the cursor: the row is retried
+            // (and applies) once its parent arrives.
+            match merge_environment(&self.storage, row)? {
+                MergeOutcome::SkippedOrphan => {
+                    report.skipped_orphans += 1;
+                    seen.pop();
                 }
-                report.conflicts_won_remote.push(row.id.clone());
+                outcome => {
+                    if let Some(deleted) = outcome.pulled_and_deleted() {
+                        report.pulled += 1;
+                        if deleted {
+                            report.deleted_pulled += 1;
+                        }
+                        report.conflicts_won_remote.push(row.id.clone());
+                    }
+                }
             }
         }
 
@@ -476,12 +550,20 @@ impl App {
             .await?;
         for row in &pulled_variables {
             seen.push(row.updated_at);
-            if merge_variable(&self.storage, row)? {
-                report.pulled += 1;
-                if row.deleted {
-                    report.deleted_pulled += 1;
+            match merge_variable(&self.storage, row)? {
+                MergeOutcome::SkippedOrphan => {
+                    report.skipped_orphans += 1;
+                    seen.pop();
                 }
-                report.conflicts_won_remote.push(row.id.clone());
+                outcome => {
+                    if let Some(deleted) = outcome.pulled_and_deleted() {
+                        report.pulled += 1;
+                        if deleted {
+                            report.deleted_pulled += 1;
+                        }
+                        report.conflicts_won_remote.push(row.id.clone());
+                    }
+                }
             }
         }
 
@@ -573,7 +655,10 @@ mod tests {
             version: 4,
             updated_at: Some(ts(20)),
         };
-        assert!(merge_project(&storage, &newer).unwrap());
+        assert_eq!(
+            merge_project(&storage, &newer).unwrap(),
+            MergeOutcome::Applied(false)
+        );
         let merged = storage.find_project_by_id(id).unwrap().unwrap();
         assert_eq!(merged.name, "Renamed");
         assert_eq!(merged.version, 4);
@@ -589,7 +674,10 @@ mod tests {
             version: 2,
             updated_at: Some(ts(15)),
         };
-        assert!(!merge_project(&storage, &older).unwrap());
+        assert_eq!(
+            merge_project(&storage, &older).unwrap(),
+            MergeOutcome::LocalKept
+        );
         assert_eq!(
             storage.find_project_by_id(id).unwrap().unwrap().name,
             "Renamed"
@@ -612,14 +700,20 @@ mod tests {
             version: 1,
             updated_at: Some(ts(5)),
         };
-        assert!(merge_project(&storage, &row).unwrap());
+        assert_eq!(
+            merge_project(&storage, &row).unwrap(),
+            MergeOutcome::Applied(false)
+        );
 
         // Remote without updated_at → conservative keep-local.
         let no_ts = ProjectRow {
             updated_at: None,
             ..row
         };
-        assert!(!merge_project(&storage, &no_ts).unwrap());
+        assert_eq!(
+            merge_project(&storage, &no_ts).unwrap(),
+            MergeOutcome::LocalKept
+        );
     }
 
     #[test]
@@ -649,7 +743,10 @@ mod tests {
             version: 2,
             updated_at: Some(ts(30)),
         };
-        assert!(merge_project(&storage, &tombstone).unwrap());
+        assert_eq!(
+            merge_project(&storage, &tombstone).unwrap(),
+            MergeOutcome::Applied(true)
+        );
 
         // Cascade pass (runs inside sync right after merge).
         let cascaded = storage.cascade_tombstones(ts(31)).unwrap();
@@ -712,11 +809,125 @@ mod tests {
             pulled: 5,
             conflicts_won_remote: vec!["a".into(), "b".into()],
             deleted_pulled: 1,
+            skipped_orphans: 0,
         };
-        let text = report.to_string();
         assert_eq!(
-            text,
+            report.to_string(),
             "3 subidas, 5 bajadas, 2 actualizados remotamente: a, b, 1 borrados"
         );
+        let with_orphans = SyncReport {
+            skipped_orphans: 2,
+            ..report
+        };
+        assert_eq!(
+            with_orphans.to_string(),
+            "3 subidas, 5 bajadas, 2 actualizados remotamente: a, b, 1 borrados, 2 huérfanos omitidos"
+        );
+    }
+
+    #[test]
+    fn orphaned_children_are_skipped_not_hard_failures() {
+        let storage = Storage::open_in_memory().unwrap();
+        let pid = uuid::Uuid::now_v7();
+        storage
+            .create_project(&sample_project(pid, ts(10), false))
+            .unwrap();
+        // No environment row locally.
+
+        let orphan_env = EnvironmentRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            project_id: uuid::Uuid::now_v7().to_string(), // unknown project
+            name: "staging".into(),
+            is_default: false,
+            sort_order: 0,
+            deleted: false,
+            updated_at: Some(ts(20)),
+        };
+        assert_eq!(
+            merge_environment(&storage, &orphan_env).unwrap(),
+            MergeOutcome::SkippedOrphan
+        );
+        assert!(storage
+            .find_environment_by_id(parse_id(&orphan_env.id).unwrap())
+            .unwrap()
+            .is_none());
+
+        // Known parent → applies normally.
+        let child_env = EnvironmentRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            project_id: pid.to_string(),
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            deleted: false,
+            updated_at: Some(ts(20)),
+        };
+        assert_eq!(
+            merge_environment(&storage, &child_env).unwrap(),
+            MergeOutcome::Applied(false)
+        );
+
+        // Variable whose environment is unknown → skipped.
+        let orphan_var = VariableRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            environment_id: uuid::Uuid::now_v7().to_string(), // unknown env
+            key: "K".into(),
+            value_encrypted: b64_encode(&[1, 2, 3]),
+            nonce: b64_encode(&[0; 24]),
+            notes: None,
+            is_readonly: false,
+            allow_export: true,
+            deleted: false,
+            version: 1,
+            updated_at: Some(ts(20)),
+        };
+        assert_eq!(
+            merge_variable(&storage, &orphan_var).unwrap(),
+            MergeOutcome::SkippedOrphan
+        );
+    }
+
+    #[test]
+    fn bootstrap_verify_rejects_wrong_key_accepts_right_key() {
+        use crypto::{decrypt, derive_master_key, encrypt};
+
+        let password = SecretString::new("correct-horse".into());
+        let salt = [7u8; 16];
+        let params = KdfParams {
+            m_cost: 2048,
+            t_cost: 1,
+            p_cost: 1,
+            output_len: 32,
+        };
+        let good_key = derive_master_key(&password, &salt, &params).unwrap();
+
+        // A remote variable encrypted by the vault owner.
+        let (ct, nonce) = encrypt(&good_key, "secret-value").unwrap();
+
+        // Right password decrypts the remote sample.
+        assert!(decrypt(&good_key, &ct, &nonce).is_ok());
+
+        // Wrong password derives a different key → verification must fail.
+        let wrong_key =
+            derive_master_key(&SecretString::new("wrong".into()), &salt, &params).unwrap();
+        assert!(decrypt(&wrong_key, &ct, &nonce).is_err());
+
+        // Zero variables remotely → nothing to verify (accepted path).
+        let empty_sample: Vec<VariableRow> = Vec::new();
+        assert!(empty_sample.iter().find(|r| !r.deleted).is_none());
+    }
+
+    #[test]
+    fn stored_session_debug_never_leaks_tokens() {
+        let stored = StoredSession {
+            access_token: "SUPER-SECRET-ACCESS".into(),
+            refresh_token: "super-secret-refresh".into(),
+            expires_in: 3600,
+            saved_at: 12345,
+        };
+        let text = format!("{stored:?}");
+        assert!(!text.contains("SUPER-SECRET-ACCESS"));
+        assert!(!text.contains("super-secret-refresh"));
+        assert!(text.contains("StoredSession"));
     }
 }

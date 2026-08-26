@@ -24,8 +24,8 @@ pub enum CoreError {
     Sync(#[from] ::sync::SyncError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("invalid master password")]
-    InvalidPassword,
+    #[error("{0}")]
+    InvalidPassword(String),
     #[error("vault is locked")]
     Locked,
     #[error("project already exists")]
@@ -42,6 +42,13 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Other(String),
+}
+
+impl CoreError {
+    /// Default invalid-password error (no extra context).
+    pub fn invalid_password() -> Self {
+        Self::InvalidPassword("invalid master password".into())
+    }
 }
 
 /// Main entry point for all operations.
@@ -95,9 +102,9 @@ impl App {
         let key = derive_master_key(&password, &meta.salt, &meta.kdf_params)?;
         // Verify password by decrypting the vault verifier marker.
         let marker = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
-            .map_err(|_| CoreError::InvalidPassword)?;
+            .map_err(|_| CoreError::invalid_password())?;
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
-            return Err(CoreError::InvalidPassword);
+            return Err(CoreError::invalid_password());
         }
         self.last_session_error = session::save_master_key(&key).err().map(|e| e.to_string());
         self.master_key = Some(key);
@@ -115,9 +122,9 @@ impl App {
         let meta = self.storage.get_vault_meta()?;
         let key = derive_master_key(&password, &meta.salt, &meta.kdf_params)?;
         let marker = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
-            .map_err(|_| CoreError::InvalidPassword)?;
+            .map_err(|_| CoreError::invalid_password())?;
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
-            return Err(CoreError::InvalidPassword);
+            return Err(CoreError::invalid_password());
         }
         Ok(())
     }
@@ -129,10 +136,10 @@ impl App {
         }
         let meta = self.storage.get_vault_meta()?;
         let marker = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
-            .map_err(|_| CoreError::InvalidPassword)?;
+            .map_err(|_| CoreError::invalid_password())?;
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
             let _ = session::clear_session();
-            return Err(CoreError::InvalidPassword);
+            return Err(CoreError::invalid_password());
         }
         self.master_key = Some(key);
         Ok(())
