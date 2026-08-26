@@ -23,7 +23,7 @@ struct Cli {
 enum Commands {
     /// Initialize a new local vault
     Init,
-    /// Unlock the vault and store a session (OS keyring, memory if unavailable)
+    /// Unlock the vault and store a session (OS keyring, 0600 session file if unavailable)
     Unlock,
     /// Clear session (keyring + session file)
     Lock,
