@@ -62,13 +62,15 @@ impl fmt::Display for SyncReport {
     }
 }
 
-// ---------- Supabase session persistence (OS keyring only) ----------
+// ---------- Supabase session persistence (OS keyring, file fallback) ----------
 
 #[derive(Serialize, Deserialize)]
 struct StoredSession {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
+    /// `sub` del JWT (owner_id de las filas).
+    user_id: String,
     /// Unix seconds when the tokens were persisted.
     saved_at: u64,
 }
@@ -91,6 +93,47 @@ fn supabase_entry() -> Result<Entry, CoreError> {
     })
 }
 
+fn supabase_session_file() -> Result<std::path::PathBuf, CoreError> {
+    let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")
+        .map(|d| d.data_dir().to_path_buf())
+        .ok_or_else(|| CoreError::Other("cannot determine Vaultr data directory".into()))?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("sync-session.json"))
+}
+
+fn save_supabase_file(stored: &StoredSession) -> Result<(), CoreError> {
+    let path = supabase_session_file()?;
+    let json = serde_json::to_string(stored).map_err(|e| CoreError::Other(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(json.as_bytes())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+fn load_supabase_file() -> Result<Option<StoredSession>, CoreError> {
+    let path = supabase_session_file()?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Other(format!("sync session file: {e}"))),
+    };
+    serde_json::from_str(&raw).map(Some).map_err(|_| {
+        CoreError::Other("corrupt Supabase session file; run 'vltr login' again".into())
+    })
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -99,29 +142,43 @@ fn now_unix() -> u64 {
 }
 
 fn save_supabase_session(session: &Session) -> Result<(), CoreError> {
-    let entry = supabase_entry()?;
     let stored = StoredSession {
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
         expires_in: session.expires_in,
+        user_id: session.user_id.clone(),
         saved_at: now_unix(),
     };
-    entry
-        .set_password(&serde_json::to_string(&stored).map_err(|e| CoreError::Other(e.to_string()))?)
-        .map_err(|e| CoreError::Other(format!("keyring: {e}")))?;
-    Ok(())
+    // Keyring primero (con verificación de lectura); archivo 0600 como
+    // fallback (mismo patrón que la master key).
+    let json = serde_json::to_string(&stored).map_err(|e| CoreError::Other(e.to_string()))?;
+    if let Ok(entry) = supabase_entry() {
+        if entry.set_password(&json).is_ok()
+            && entry.get_password().map(|r| r == json).unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let _ = entry.delete_credential();
+    }
+    save_supabase_file(&stored)
 }
 
 fn load_stored_session() -> Result<Option<StoredSession>, CoreError> {
-    let entry = supabase_entry()?;
-    let raw = match entry.get_password() {
-        Ok(raw) => raw,
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(e) => return Err(CoreError::Other(format!("keyring: {e}"))),
-    };
-    serde_json::from_str(&raw).map(Some).map_err(|_| {
-        CoreError::Other("corrupt Supabase session in keyring; run sync login again".into())
-    })
+    if let Ok(entry) = supabase_entry() {
+        match entry.get_password() {
+            Ok(raw) => {
+                let stored: StoredSession = serde_json::from_str(&raw).map_err(|_| {
+                    CoreError::Other(
+                        "corrupt Supabase session in keyring; run 'vltr login' again".into(),
+                    )
+                })?;
+                return Ok(Some(stored));
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(CoreError::Other(format!("keyring: {e}"))),
+        }
+    }
+    load_supabase_file()
 }
 
 fn clear_supabase_session() -> Result<(), CoreError> {
@@ -132,15 +189,36 @@ fn clear_supabase_session() -> Result<(), CoreError> {
     }
 }
 
+/// Supabase credentials: env vars first, then `<data_dir>/sync.json`
+/// (`{"url":"...","key":"..."}`, modo 0600 recomendado). El archivo evita
+/// depender del entorno en cron/scripts.
+fn read_sync_config() -> Option<(String, String)> {
+    if let (Ok(url), Ok(key)) = (
+        std::env::var(SUPABASE_URL_ENV),
+        std::env::var(SUPABASE_KEY_ENV),
+    ) {
+        if !url.is_empty() && !key.is_empty() {
+            return Some((url, key));
+        }
+    }
+    let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")?;
+    let path = dir.data_dir().join("sync.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct Conf {
+        url: String,
+        key: String,
+    }
+    let conf: Conf = serde_json::from_str(&raw).ok()?;
+    (!conf.url.is_empty() && !conf.key.is_empty()).then_some((conf.url, conf.key))
+}
+
 fn sync_client() -> Result<SyncClient, CoreError> {
-    let url = std::env::var(SUPABASE_URL_ENV)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| CoreError::Other(format!("sync not configured; set {SUPABASE_URL_ENV}")))?;
-    let key = std::env::var(SUPABASE_KEY_ENV)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| CoreError::Other(format!("sync not configured; set {SUPABASE_KEY_ENV}")))?;
+    let (url, key) = read_sync_config().ok_or_else(|| {
+        CoreError::Other(format!(
+            "sync not configured; set {SUPABASE_URL_ENV} and {SUPABASE_KEY_ENV} or create sync.json"
+        ))
+    })?;
     SyncClient::new(&url, &key).map_err(CoreError::from)
 }
 
@@ -153,6 +231,7 @@ async fn fresh_session(client: &SyncClient) -> Result<Session, CoreError> {
             access_token: stored.access_token,
             refresh_token: stored.refresh_token,
             expires_in: stored.expires_in,
+            user_id: stored.user_id,
         });
     }
     let refreshed = client.refresh(&stored.refresh_token).await.map_err(|e| {
@@ -182,6 +261,7 @@ fn parse_id(s: &str) -> Result<Id, CoreError> {
 
 fn project_to_dto(p: &Project) -> ProjectRow {
     ProjectRow {
+        owner_id: None,
         id: p.id.to_string(),
         name: p.name.clone(),
         description: p.description.clone(),
@@ -195,6 +275,7 @@ fn project_to_dto(p: &Project) -> ProjectRow {
 
 fn environment_to_dto(e: &Environment) -> EnvironmentRow {
     EnvironmentRow {
+        owner_id: None,
         id: e.id.to_string(),
         project_id: e.project_id.to_string(),
         name: e.name.clone(),
@@ -207,6 +288,7 @@ fn environment_to_dto(e: &Environment) -> EnvironmentRow {
 
 fn variable_to_dto(v: &Variable) -> VariableRow {
     VariableRow {
+        owner_id: None,
         id: v.id.to_string(),
         environment_id: v.environment_id.to_string(),
         key: v.key.clone(),
@@ -365,8 +447,7 @@ fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, 
 impl App {
     /// True when the Supabase env vars are present (sync is configurable).
     pub fn sync_available_config() -> bool {
-        std::env::var(SUPABASE_URL_ENV).is_ok_and(|v| !v.is_empty())
-            && std::env::var(SUPABASE_KEY_ENV).is_ok_and(|v| !v.is_empty())
+        read_sync_config().is_some()
     }
 
     /// True when a vault exists on the server (requires a stored session).
@@ -477,10 +558,22 @@ impl App {
         let environments = self.storage.dirty_environments()?;
         let variables = self.storage.dirty_variables()?;
 
-        let project_dtos: Vec<ProjectRow> = projects.iter().map(project_to_dto).collect();
-        let environment_dtos: Vec<EnvironmentRow> =
+        let mut project_dtos: Vec<ProjectRow> = projects.iter().map(project_to_dto).collect();
+        let mut environment_dtos: Vec<EnvironmentRow> =
             environments.iter().map(environment_to_dto).collect();
-        let variable_dtos: Vec<VariableRow> = variables.iter().map(variable_to_dto).collect();
+        let mut variable_dtos: Vec<VariableRow> = variables.iter().map(variable_to_dto).collect();
+
+        // El DEFAULT auth.uid() de columna no es fiable: estampar owner_id.
+        let uid = Some(session.user_id.clone());
+        for r in &mut project_dtos {
+            r.owner_id = uid.clone();
+        }
+        for r in &mut environment_dtos {
+            r.owner_id = uid.clone();
+        }
+        for r in &mut variable_dtos {
+            r.owner_id = uid.clone();
+        }
 
         // Order matters: parents before children so FKs hold server-side.
         client
@@ -658,6 +751,7 @@ mod tests {
             .create_project(&sample_project(id, ts(10), false))
             .unwrap();
         let newer = ProjectRow {
+            owner_id: None,
             id: id.to_string(),
             name: "Renamed".into(),
             description: Some("from remote".into()),
@@ -677,6 +771,7 @@ mod tests {
 
         // Local newer → remote loses, local untouched.
         let older = ProjectRow {
+            owner_id: None,
             id: id.to_string(),
             name: "Stale".into(),
             description: None,
@@ -703,6 +798,7 @@ mod tests {
 
         // Missing locally → insert.
         let row = ProjectRow {
+            owner_id: None,
             id: id.to_string(),
             name: "New".into(),
             description: None,
@@ -746,6 +842,7 @@ mod tests {
 
         // Pull: parent tombstoned remotely, strictly newer than local.
         let tombstone = ProjectRow {
+            owner_id: None,
             id: pid.to_string(),
             name: "P".into(),
             description: None,
@@ -847,6 +944,7 @@ mod tests {
         // No environment row locally.
 
         let orphan_env = EnvironmentRow {
+            owner_id: None,
             id: uuid::Uuid::now_v7().to_string(),
             project_id: uuid::Uuid::now_v7().to_string(), // unknown project
             name: "staging".into(),
@@ -866,6 +964,7 @@ mod tests {
 
         // Known parent → applies normally.
         let child_env = EnvironmentRow {
+            owner_id: None,
             id: uuid::Uuid::now_v7().to_string(),
             project_id: pid.to_string(),
             name: "local".into(),
@@ -881,6 +980,7 @@ mod tests {
 
         // Variable whose environment is unknown → skipped.
         let orphan_var = VariableRow {
+            owner_id: None,
             id: uuid::Uuid::now_v7().to_string(),
             environment_id: uuid::Uuid::now_v7().to_string(), // unknown env
             key: "K".into(),
@@ -935,6 +1035,7 @@ mod tests {
             access_token: "SUPER-SECRET-ACCESS".into(),
             refresh_token: "super-secret-refresh".into(),
             expires_in: 3600,
+            user_id: "u".into(),
             saved_at: 12345,
         };
         let text = format!("{stored:?}");

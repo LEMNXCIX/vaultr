@@ -7,6 +7,14 @@ pub struct Session {
     pub refresh_token: String,
     #[serde(default)]
     pub expires_in: u64,
+    /// `sub` del JWT; se estampa como `owner_id` en cada fila pusheada.
+    #[serde(default)]
+    pub user_id: String,
+}
+
+#[derive(Deserialize)]
+struct GoTrueUser {
+    id: String,
 }
 
 #[derive(Serialize)]
@@ -60,6 +68,14 @@ impl super::SyncClient {
     }
 
     async fn auth_post<B: Serialize>(&self, url: &str, body: &B) -> Result<Session> {
+        #[derive(Deserialize)]
+        struct GoTrueSession {
+            #[serde(flatten)]
+            session: Session,
+            #[serde(default)]
+            user: Option<GoTrueUser>,
+        }
+
         let resp = self
             .http
             .post(url)
@@ -72,7 +88,11 @@ impl super::SyncClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(SyncError::Auth(parse_auth_error(&text)));
         }
-        resp.json::<Session>().await.map_err(Into::into)
+        let mut parsed: GoTrueSession = resp.json().await.map_err(SyncError::Http)?;
+        if let Some(user) = parsed.user {
+            parsed.session.user_id = user.id;
+        }
+        Ok(parsed.session)
     }
 }
 

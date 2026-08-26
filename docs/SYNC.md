@@ -27,15 +27,24 @@ supabase db push
 
 ## Configuración
 
-Variables de entorno que consumirá el cliente de sync (futuro):
+Credenciales del cliente de sync, en orden de prioridad:
+
+1. Variables de entorno:
 
 | Var                  | Descripción                                    |
 |----------------------|------------------------------------------------|
 | `VAULTR_SUPABASE_URL`   | URL del proyecto (`https://<ref>.supabase.co`) |
 | `VAULTR_SUPABASE_KEY`   | Clave publishable/anon (nunca service_role en cliente) |
 
-La autenticación de usuario usa Supabase Auth; el `owner_id` de cada fila se
-resuelve con `auth.uid()` y RLS garantiza que solo ves tus filas.
+2. Archivo `<data_dir>/sync.json` (útil para cron/scripts donde el entorno no
+   es fiable): `{"url":"https://<ref>.supabase.co","key":"sb_publishable_..."}`.
+   Crear con permisos 0600.
+
+La autenticación de usuario usa Supabase Auth (email+password vía
+`vltr login`); la sesión (JWT + refresh) se guarda en el OS keyring o, si no
+está disponible, en un archivo local 0600. El `owner_id` de cada fila se
+estampa explícitamente desde el JWT (no confiar en defaults del server) y
+RLS garantiza que solo ves tus filas.
 
 ## Qué se sincroniza
 

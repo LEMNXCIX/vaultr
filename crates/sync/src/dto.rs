@@ -7,15 +7,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VaultRow {
+    pub owner_id: Option<String>,
     /// base64
     pub salt: String,
     pub kdf_params: serde_json::Value,
 }
 
-// owner_id/created_at/updated_at are server-side; not sent or needed on pull.
+// created_at/updated_at are server-side; not sent or needed on pull.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectRow {
+    pub owner_id: Option<String>,
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,6 +38,7 @@ pub struct ProjectRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EnvironmentRow {
+    pub owner_id: Option<String>,
     pub id: String,
     pub project_id: String,
     pub name: String,
@@ -53,6 +56,7 @@ pub struct EnvironmentRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VariableRow {
+    pub owner_id: Option<String>,
     pub id: String,
     pub environment_id: String,
     pub key: String,
@@ -91,6 +95,7 @@ mod tests {
     #[test]
     fn variable_row_roundtrip_snake_case() {
         let row = VariableRow {
+            owner_id: None,
             id: "018f0000-0000-7000-8000-000000000001".into(),
             environment_id: "018f0000-0000-7000-8000-000000000002".into(),
             key: "API_KEY".into(),
@@ -133,6 +138,7 @@ mod tests {
     #[test]
     fn vault_row_kdf_params_is_opaque_json() {
         let row = VaultRow {
+            owner_id: None,
             salt: "c2FsdA==".into(),
             kdf_params: serde_json::json!({"m": 19456, "t": 2, "p": 1}),
         };

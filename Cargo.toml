@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 # Testing
 tempfile = "3.10.1"
-keyring = "3.6.1"
+keyring = { version = "3.6.1", features = ["linux-native"] }
 hex = "0.4.3"
 
 

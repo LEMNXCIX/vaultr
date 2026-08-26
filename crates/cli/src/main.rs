@@ -530,7 +530,7 @@ fn main() -> Result<()> {
 fn require_sync_config() -> Result<()> {
     if !App::sync_available_config() {
         bail!(
-            "Sync no configurado: define {} y {} (ver docs/SYNC.md)",
+            "Sync no configurado: define {} y {} o crea sync.json (ver docs/SYNC.md)",
             vltr_core::sync::SUPABASE_URL_ENV,
             vltr_core::sync::SUPABASE_KEY_ENV
         );

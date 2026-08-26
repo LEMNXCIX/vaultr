@@ -38,8 +38,13 @@ impl SyncClient {
             ));
         }
         let base_url = base_url.trim_end_matches('/').to_string();
+        // ponytail: timeout fijo de 30s; configurable si sync por lotes grandes lo necesita
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(SyncError::Http)?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http,
             base_url,
             anon_key: anon_key.to_string(),
         })
@@ -53,6 +58,7 @@ impl SyncClient {
         kdf_params_json: &str,
     ) -> Result<()> {
         let row = VaultRow {
+            owner_id: Some(session.user_id.clone()),
             salt: salt_b64.to_string(),
             kdf_params: serde_json::from_str(kdf_params_json)
                 .map_err(|e| SyncError::Config(format!("invalid kdf params json: {e}")))?,
