@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{Storage, SyncState, SyncTable};
 
 use crate::{App, CoreError};
-use crypto::{derive_master_key, encrypt};
+use crypto::{decrypt, derive_master_key, encrypt, MasterKey};
 use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow};
 
 pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
@@ -486,6 +486,40 @@ fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, 
 
 // ---------- App methods ----------
 
+/// Verify a derived key against a sample of remote variable ciphertexts.
+/// Prefers a live row, falling back to any row (tombstones still carry a
+/// ciphertext). An empty sample — remote exists but has no variables yet —
+/// is accepted: there is nothing to check against. Pure; unit-testable.
+fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<(), CoreError> {
+    let Some(first) = sample
+        .iter()
+        .find(|r| !r.deleted)
+        .or_else(|| sample.first())
+    else {
+        return Ok(());
+    };
+    let ct = b64_decode(&first.value_encrypted)?;
+    let nonce = b64_decode(&first.nonce)?;
+    if decrypt(key, &ct, &nonce).is_err() {
+        return Err(CoreError::InvalidPassword(
+            "la contraseña no descifra el vault remoto; revísala e inténtalo de nuevo".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pull one page of remote variables and verify `key` against a sample.
+async fn verify_password_against_remote(
+    client: &SyncClient,
+    session: &Session,
+    key: &MasterKey,
+) -> Result<(), CoreError> {
+    let sample = client
+        .pull_page::<VariableRow>(session, "variables")
+        .await?;
+    verify_key_against_sample(key, &sample)
+}
+
 impl App {
     /// True when the Supabase env vars are present (sync is configurable).
     pub fn sync_available_config() -> bool {
@@ -539,6 +573,13 @@ impl App {
             && matches!(load_stored_session(), Ok(Some(_)))
     }
 
+    /// True when a Supabase session is stored (keyring or fallback file),
+    /// regardless of how sync is configured. Unlike [`App::sync_enabled`],
+    /// this checks the session alone — env vars / sync.json are irrelevant.
+    pub fn sync_session_exists() -> bool {
+        matches!(load_stored_session(), Ok(Some(_)))
+    }
+
     /// New device: take the vault metadata from the server, initialize the
     /// local vault with it and unlock. Fails if a local vault already exists.
     /// The master-key session is intentionally NOT persisted.
@@ -562,29 +603,68 @@ impl App {
         // No verifier travels over the wire; derive locally and verify
         // against a real remote ciphertext before touching the local vault.
         let key = derive_master_key(&password, &salt, &kdf_params)?;
-        let sample = client
-            .pull_page::<VariableRow>(&session, "variables")
-            .await?;
-        if let Some(first) = sample
-            .iter()
-            .find(|r| !r.deleted)
-            .or_else(|| sample.first())
-        {
-            let ct = b64_decode(&first.value_encrypted)?;
-            let nonce = b64_decode(&first.nonce)?;
-            if crypto::decrypt(&key, &ct, &nonce).is_err() {
-                return Err(CoreError::InvalidPassword(
-                    "la contraseña no descifra el vault remoto; revísala e inténtalo de nuevo"
-                        .into(),
-                ));
-            }
-        }
+        verify_password_against_remote(&client, &session, &key).await?;
 
         let (verifier_ct, verifier_nonce) =
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
             .init_vault(&salt, &kdf_params, &verifier_ct, &verifier_nonce)?;
         self.master_key = Some(key);
+        Ok(())
+    }
+
+    /// Adopt the remote vault's key after a `RemoteKeyChanged` abort.
+    ///
+    /// `password` must be the one currently protecting the REMOTE vault: its
+    /// salt + kdf params derive the new key, verified against a remote sample
+    /// ciphertext before anything local is touched. Every local variable is
+    /// then re-encrypted under that key (the old in-memory key decrypts the
+    /// local rows — the independent-init case included) and `vault_meta` is
+    /// replaced by the remote one, so the next sync finds matching salts.
+    /// The pull cursor is deliberately untouched: rows merge normally on the
+    /// re-run. No rekey marker is needed — local now equals remote.
+    /// The vault must be unlocked.
+    pub async fn adopt_remote_key(&mut self, password: SecretString) -> Result<(), CoreError> {
+        if !self.storage.is_initialized()? {
+            return Err(CoreError::Other("vault not initialized".into()));
+        }
+        let client = sync_client()?;
+        let session = fresh_session(&client).await?;
+        let vault = client
+            .get_vault(&session)
+            .await?
+            .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
+
+        let remote_salt = b64_decode(&vault.salt)?;
+        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
+            .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
+
+        let new_key = derive_master_key(&password, &remote_salt, &kdf_params)?;
+        verify_password_against_remote(&client, &session, &new_key).await?;
+
+        let old_key = self.require_key()?;
+        let variables = self.storage.all_variables()?;
+        let mut reencrypted = Vec::with_capacity(variables.len());
+        for var in &variables {
+            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce)?;
+            let (ciphertext, nonce) = encrypt(&new_key, plaintext.as_str())?;
+            reencrypted.push((var.id, ciphertext, nonce));
+        }
+
+        let (verifier_ct, verifier_nonce) =
+            encrypt(&new_key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+        self.storage.apply_key_rotation(
+            &reencrypted,
+            &remote_salt,
+            &kdf_params,
+            &verifier_ct,
+            &verifier_nonce,
+        )?;
+
+        self.last_session_error = crate::session::save_master_key(&new_key)
+            .err()
+            .map(|e| e.to_string());
+        self.master_key = Some(new_key);
         Ok(())
     }
 
@@ -1130,8 +1210,8 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_verify_rejects_wrong_key_accepts_right_key() {
-        use crypto::{decrypt, derive_master_key, encrypt};
+    fn remote_sample_verification_accepts_right_key_and_empty_sample() {
+        use crypto::{derive_master_key, encrypt};
 
         let password = SecretString::new("correct-horse".into());
         let salt = [7u8; 16];
@@ -1142,21 +1222,42 @@ mod tests {
             output_len: 32,
         };
         let good_key = derive_master_key(&password, &salt, &params).unwrap();
+        let wrong_key =
+            derive_master_key(&SecretString::new("wrong".into()), &salt, &params).unwrap();
 
         // A remote variable encrypted by the vault owner.
         let (ct, nonce) = encrypt(&good_key, "secret-value").unwrap();
+        let row = VariableRow {
+            owner_id: None,
+            id: "018f0000-0000-7000-8000-000000000001".into(),
+            environment_id: "018f0000-0000-7000-8000-000000000002".into(),
+            key: "K".into(),
+            value_encrypted: b64_encode(&ct),
+            nonce: b64_encode(&nonce),
+            notes: None,
+            is_readonly: false,
+            allow_export: true,
+            deleted: false,
+            version: 1,
+            updated_at: None,
+        };
 
         // Right password decrypts the remote sample.
-        assert!(decrypt(&good_key, &ct, &nonce).is_ok());
+        assert!(verify_key_against_sample(&good_key, std::slice::from_ref(&row)).is_ok());
 
-        // Wrong password derives a different key → verification must fail.
-        let wrong_key =
-            derive_master_key(&SecretString::new("wrong".into()), &salt, &params).unwrap();
-        assert!(decrypt(&wrong_key, &ct, &nonce).is_err());
+        // Wrong password derives a different key → typed invalid-password error.
+        assert!(matches!(
+            verify_key_against_sample(&wrong_key, std::slice::from_ref(&row)),
+            Err(CoreError::InvalidPassword(_))
+        ));
 
         // Zero variables remotely → nothing to verify (accepted path).
-        let empty_sample: Vec<VariableRow> = Vec::new();
-        assert!(empty_sample.iter().find(|r| !r.deleted).is_none());
+        assert!(verify_key_against_sample(&good_key, &[]).is_ok());
+
+        // Only tombstones → they still carry ciphertext; verification proceeds.
+        let mut tombstone = row;
+        tombstone.deleted = true;
+        assert!(verify_key_against_sample(&good_key, &[tombstone]).is_ok());
     }
 
     #[test]

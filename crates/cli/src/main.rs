@@ -196,6 +196,20 @@ fn main() -> Result<()> {
                     db_path.display()
                 );
             }
+            // Remote guard: initializing here when this account already has a
+            // vault on the server would create a divergent key domain. Never
+            // block init on network trouble — local-first above all.
+            if App::sync_available_config() && App::sync_session_exists() {
+                match block_on(App::remote_has_vault()) {
+                    Ok(true) => bail!(
+                        "A vault already exists on the server for this account. Run `vltr bootstrap` to join it with the same master password."
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("Warning: could not check the remote vault ({e}); proceeding with local init.");
+                    }
+                }
+            }
             let password = prompt_password("Create master password: ")?;
             let confirm = prompt_password("Confirm master password: ")?;
             if !crypto::passwords_match(&password, &confirm) {
@@ -547,9 +561,25 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let app = open_and_unlock(&db_path)?;
+            let mut app = open_and_unlock(&db_path)?;
             match block_on(app.sync()) {
                 Ok(report) => println!("Sincronización completada: {report}"),
+                Err(vltr_core::CoreError::RemoteKeyChanged) => {
+                    eprintln!(
+                        "La contraseña maestra del vault cambió en otro dispositivo (o este vault se inicializó de forma independiente); hace falta la contraseña del vault remoto para continuar."
+                    );
+                    let password = prompt_password("New master password: ")?;
+                    block_on(app.adopt_remote_key(password))?;
+                    // Salts match after a successful adopt, so this re-run
+                    // cannot loop on the same abort — surface it if it happens.
+                    match block_on(app.sync()) {
+                        Ok(report) => println!("Sincronización completada: {report}"),
+                        Err(vltr_core::CoreError::RemoteKeyChanged) => {
+                            bail!("El vault remoto cambió de nuevo; vuelve a intentarlo.")
+                        }
+                        Err(e) => bail!("Sin conexión con Supabase: {e}"),
+                    }
+                }
                 Err(e) => bail!("Sin conexión con Supabase: {e}"),
             }
         }
