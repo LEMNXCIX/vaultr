@@ -467,6 +467,24 @@ impl App {
         save_supabase_session(&session)
     }
 
+    /// Create a Supabase account. Returns `true` when the response carried a
+    /// session (email confirmation disabled — it is persisted like a login),
+    /// `false` when the account awaits email confirmation.
+    pub async fn sync_signup(&self, email: &str, password: &str) -> Result<bool, CoreError> {
+        let client = sync_client()?;
+        let session = client
+            .signup(email, password)
+            .await
+            .map_err(|e| CoreError::Other(format!("supabase signup failed: {e}")))?;
+        match session {
+            Some(session) => {
+                save_supabase_session(&session)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Remove the stored Supabase session.
     pub fn sync_logout(&self) -> Result<(), CoreError> {
         clear_supabase_session()

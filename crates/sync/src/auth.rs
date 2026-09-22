@@ -17,6 +17,15 @@ struct GoTrueUser {
     id: String,
 }
 
+/// Full GoTrue token response, optionally carrying the `user` object.
+#[derive(Deserialize)]
+struct GoTrueSession {
+    #[serde(flatten)]
+    session: Session,
+    #[serde(default)]
+    user: Option<GoTrueUser>,
+}
+
 #[derive(Serialize)]
 struct PasswordGrant<'a> {
     email: &'a str,
@@ -67,15 +76,26 @@ impl super::SyncClient {
         .await
     }
 
-    async fn auth_post<B: Serialize>(&self, url: &str, body: &B) -> Result<Session> {
-        #[derive(Deserialize)]
-        struct GoTrueSession {
-            #[serde(flatten)]
-            session: Session,
-            #[serde(default)]
-            user: Option<GoTrueUser>,
-        }
+    /// Create an account via `{base}/auth/v1/signup`.
+    ///
+    /// GoTrue returns a full session (tokens) when email confirmation is
+    /// disabled, or just the user object — without tokens — when confirmation
+    /// is pending. `Ok(Some(session))` means the session can be persisted
+    /// right away; `Ok(None)` means a confirmation email was sent.
+    pub async fn signup(&self, email: &str, password: &str) -> Result<Option<Session>> {
+        let resp = self
+            .http
+            .post(format!("{}/auth/v1/signup", self.base_url))
+            .header("apikey", &self.anon_key)
+            .json(&PasswordGrant { email, password })
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        signup_from_response(status.is_success(), &text)
+    }
 
+    async fn auth_post<B: Serialize>(&self, url: &str, body: &B) -> Result<Session> {
         let resp = self
             .http
             .post(url)
@@ -94,6 +114,33 @@ impl super::SyncClient {
         }
         Ok(parsed.session)
     }
+}
+
+/// Map a signup HTTP response to a result (pure; unit-testable without HTTP).
+///
+/// Non-2xx → `SyncError::Auth` with the parsed GoTrue message. On success,
+/// a body carrying tokens yields `Some(session)`; a confirmation-pending body
+/// (user object only) yields `None`.
+fn signup_from_response(ok: bool, body: &str) -> std::result::Result<Option<Session>, SyncError> {
+    if !ok {
+        return Err(SyncError::Auth(parse_auth_error(body)));
+    }
+    parse_signup_session(body).map_err(SyncError::Auth)
+}
+
+fn parse_signup_session(body: &str) -> std::result::Result<Option<Session>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid signup response: {e}"))?;
+    // Confirmation pending: GoTrue returns the user object without tokens.
+    if value.get("access_token").is_none() {
+        return Ok(None);
+    }
+    let mut parsed: GoTrueSession =
+        serde_json::from_value(value).map_err(|e| format!("invalid signup response: {e}"))?;
+    if let Some(user) = parsed.user {
+        parsed.session.user_id = user.id;
+    }
+    Ok(Some(parsed.session))
 }
 
 #[cfg(test)]
@@ -131,6 +178,37 @@ mod tests {
             ),
             "Invalid refresh token"
         );
+    }
+
+    #[test]
+    fn signup_with_tokens_parses_session() {
+        let body = r#"{
+            "access_token":"eyJ...",
+            "token_type":"bearer",
+            "expires_in":3600,
+            "expires_at":1790000000,
+            "refresh_token":"rt-token",
+            "user":{"id":"user-1","email":"a@b.c"}
+        }"#;
+        let s = signup_from_response(true, body)
+            .unwrap()
+            .expect("session when email confirmation is disabled");
+        assert_eq!(s.access_token, "eyJ...");
+        assert_eq!(s.refresh_token, "rt-token");
+        assert_eq!(s.user_id, "user-1");
+    }
+
+    #[test]
+    fn signup_pending_confirmation_without_tokens_is_none() {
+        let body = r#"{"id":"user-1","aud":"authenticated","email":"a@b.c"}"#;
+        assert!(signup_from_response(true, body).unwrap().is_none());
+    }
+
+    #[test]
+    fn signup_error_body_maps_to_auth_error() {
+        let err = signup_from_response(false, r#"{"msg":"User already registered","code":422}"#)
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Auth(msg) if msg == "User already registered"));
     }
 
     #[test]

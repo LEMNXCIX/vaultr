@@ -142,6 +142,8 @@ enum Commands {
     Restore { backup: PathBuf },
     /// Log in to Supabase sync (see docs/SYNC.md for required env vars)
     Login,
+    /// Create a Supabase sync account (see docs/SYNC.md)
+    Signup,
     /// Close the Supabase sync session
     Logout,
     /// Initialize this device's vault from the remote vault
@@ -473,6 +475,21 @@ fn main() -> Result<()> {
             let password = prompt_password("Contraseña: ")?;
             block_on(app.sync_login(&email, password.expose_secret()))?;
             println!("Sesión de sincronización iniciada para {email}");
+        }
+        Commands::Signup => {
+            require_sync_config()?;
+            let app = App::open(&db_path)?;
+            let email = prompt_line("Email: ")?;
+            let password = prompt_password("Create password: ")?;
+            let confirm = prompt_password("Confirm password: ")?;
+            if !crypto::passwords_match(&password, &confirm) {
+                bail!("Passwords do not match");
+            }
+            if block_on(app.sync_signup(&email, password.expose_secret()))? {
+                println!("Cuenta creada para {email}. Sesión de sincronización iniciada.");
+            } else {
+                println!("Cuenta creada. Confirma tu email y luego ejecuta `vltr login`.");
+            }
         }
         Commands::Logout => {
             require_sync_config()?;
