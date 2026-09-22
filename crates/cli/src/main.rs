@@ -140,6 +140,8 @@ enum Commands {
     Backup { path: Option<PathBuf> },
     /// Restore vault from encrypted backup into a new db path
     Restore { backup: PathBuf },
+    /// Change the master password (re-encrypts the vault with a new key)
+    Rekey,
     /// Log in to Supabase sync (see docs/SYNC.md for required env vars)
     Login,
     /// Create a Supabase sync account (see docs/SYNC.md)
@@ -467,6 +469,26 @@ fn main() -> Result<()> {
             App::restore(&target, password, &blob)?;
             println!("Restored vault to {}", target.display());
             println!("Use SECRETS_DB or move file to the default path to open it.");
+        }
+        Commands::Rekey => {
+            let mut app = App::open(&db_path)?;
+            if !app.is_initialized()? {
+                bail!("Vault not initialized. Run `vltr init` first.");
+            }
+            let current = prompt_password("Current master password: ")?;
+            app.unlock(current)?;
+            let new = prompt_password("New master password: ")?;
+            let confirm = prompt_password("Confirm new master password: ")?;
+            if !crypto::passwords_match(&new, &confirm) {
+                bail!("Passwords do not match");
+            }
+            let count = app.rekey(new)?;
+            println!(
+                "Master password changed; {count} variable{} re-encrypted.",
+                if count == 1 { "" } else { "s" }
+            );
+            println!("Run `vltr sync` to propagate the new key to other devices.");
+            print_session_status(&mut app);
         }
         Commands::Login => {
             require_sync_config()?;

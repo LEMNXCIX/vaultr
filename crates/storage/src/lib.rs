@@ -171,6 +171,58 @@ impl Storage {
             .ok_or(StorageError::NotInitialized)
     }
 
+    /// Atomically rotate the vault's key material (used by `rekey` and by
+    /// adoption of a remote key): swap the ciphertext of every listed
+    /// variable AND update `vault_meta` (salt, kdf params, verifier) in ONE
+    /// transaction — all of it applies or none of it does.
+    ///
+    /// `updated_at` and `version` are deliberately untouched: a mere key
+    /// rotation must never win (or lose) an LWW comparison against genuinely
+    /// newer edits from other devices. `synced_at` is cleared so each row
+    /// re-enters the dirty set (`synced_at IS NULL OR updated_at > synced_at`)
+    /// and the new ciphertext propagates on the next push.
+    pub fn apply_key_rotation(
+        &self,
+        reencrypted: &[(Id, Vec<u8>, Vec<u8>)],
+        salt: &[u8],
+        kdf_params: &KdfParams,
+        verifier_ct: &[u8],
+        verifier_nonce: &[u8],
+    ) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, ciphertext, nonce) in reencrypted {
+            let n = tx.execute(
+                "UPDATE variables SET value_encrypted = ?1, nonce = ?2, synced_at = NULL
+                 WHERE id = ?3",
+                params![ciphertext, nonce, id.to_string()],
+            )?;
+            if n == 0 {
+                // Returning drops the transaction → automatic rollback.
+                return Err(StorageError::Other(format!(
+                    "variable {id} disappeared during key rotation"
+                )));
+            }
+        }
+        let params_json = serde_json::to_string(kdf_params)?;
+        let updated = tx.execute(
+            "UPDATE vault_meta
+             SET salt = ?1, kdf_params = ?2, verifier_ct = ?3, verifier_nonce = ?4, updated_at = ?5
+             WHERE id = 1",
+            params![
+                salt,
+                params_json,
+                verifier_ct,
+                verifier_nonce,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::NotInitialized);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---------- Projects ----------
 
     pub fn create_project(&self, project: &Project) -> Result<(), StorageError> {
@@ -408,6 +460,17 @@ impl Storage {
              FROM variables WHERE environment_id = ?1 AND deleted = 0 ORDER BY key",
         )?;
         let rows = stmt.query_map(params![environment_id.to_string()], map_variable)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every variable row, tombstones included — the full ciphertext set a
+    /// key rotation must cover (`list_variables` hides deleted rows).
+    pub fn all_variables(&self) -> Result<Vec<Variable>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+             FROM variables",
+        )?;
+        let rows = stmt.query_map([], map_variable)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -935,6 +998,84 @@ mod tests {
             SyncState::get(s.conn(), "last_pull").unwrap().as_deref(),
             Some("2026-02-01T00:00:00Z")
         );
+        SyncState::remove(s.conn(), "last_pull").unwrap();
+        assert!(SyncState::get(s.conn(), "last_pull").unwrap().is_none());
+        // Removing an absent key is a no-op.
+        SyncState::remove(s.conn(), "last_pull").unwrap();
+    }
+
+    #[test]
+    fn key_rotation_keeps_lww_timestamps_and_redirties_rows() {
+        let s = Storage::open_in_memory().unwrap();
+        s.init_vault(&[1u8; 16], &KdfParams::default(), b"ct", b"nonce")
+            .unwrap();
+        let now = Utc::now();
+        let p = Project {
+            id: Uuid::now_v7(),
+            name: "P".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            owner_id: None,
+            version: 1,
+            deleted: false,
+        };
+        s.create_project(&p).unwrap();
+        let e = Environment {
+            id: Uuid::now_v7(),
+            project_id: p.id,
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        s.create_environment(&e).unwrap();
+        let v = sample_var(e.id, "K");
+        s.create_variable(&v).unwrap();
+        // Row fully synced: rotation must still redirty it.
+        s.mark_synced(
+            SyncTable::Variables,
+            &[v.id],
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        assert!(s.dirty_variables().unwrap().is_empty());
+
+        let before = s.get_variable(e.id, "K").unwrap().unwrap();
+        s.apply_key_rotation(
+            &[(v.id, vec![9, 9, 9], vec![1; 24])],
+            &[2u8; 16],
+            &KdfParams::default(),
+            b"ct2",
+            b"nonce2",
+        )
+        .unwrap();
+
+        let after = s.get_variable(e.id, "K").unwrap().unwrap();
+        assert_eq!(after.value_encrypted, vec![9, 9, 9]);
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "LWW timestamp must not move"
+        );
+        assert_eq!(after.version, before.version, "rotation is not an edit");
+
+        // New ciphertext is dirty → propagates on the next push.
+        let dirty = s.dirty_variables().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].id, v.id);
+
+        // vault_meta rotated in the same transaction.
+        let meta = s.get_vault_meta().unwrap();
+        assert_eq!(meta.salt, vec![2u8; 16]);
+
+        // Tombstones are part of the rotation set too.
+        assert_eq!(s.all_variables().unwrap().len(), 1);
+        assert!(s.delete_variable(e.id, "K").unwrap());
+        assert_eq!(s.all_variables().unwrap().len(), 1, "tombstones included");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use chrono::Utc;
 use crypto::{decrypt, derive_master_key, encrypt, generate_salt, MasterKey};
 use models::{DecryptedVariable, Environment, KdfParams, Project, Variable, VariableSummary};
 use secrecy::SecretString;
-use storage::{Storage, StorageError};
+use storage::{Storage, StorageError, SyncState};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -132,6 +132,55 @@ impl App {
             return Err(CoreError::invalid_password());
         }
         Ok(())
+    }
+
+    /// Change the master password: rotate the salt, derive a new key and
+    /// re-encrypt every variable (all environments, tombstones included).
+    ///
+    /// The vault's existing `kdf_params` are kept: they were chosen at init
+    /// and a rekey only rotates the secret material (salt + ciphertexts),
+    /// not the Argon2 cost. The `pending_rekey_salt` marker is written BEFORE
+    /// the rotation transaction: if the transaction fails, the vault is
+    /// untouched and the stale marker is inert (the sync guard only consults
+    /// it when salts actually differ, and the next rekey overwrites it), so
+    /// no crash window can strand the local vault. Returns the number of
+    /// re-encrypted variables.
+    pub fn rekey(&mut self, new_password: SecretString) -> Result<usize, CoreError> {
+        let old_key = self.require_key()?;
+        let meta = self.storage.get_vault_meta()?;
+        let salt = generate_salt();
+        let new_key = derive_master_key(&new_password, &salt, &meta.kdf_params)?;
+
+        SyncState::set(
+            self.storage.conn(),
+            sync::PENDING_REKEY_SALT_KEY,
+            &hex::encode(salt),
+        )?;
+
+        let variables = self.storage.all_variables()?;
+        let count = variables.len();
+        let mut reencrypted = Vec::with_capacity(count);
+        for var in &variables {
+            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce)?;
+            let (ciphertext, nonce) = encrypt(&new_key, plaintext.as_str())?;
+            reencrypted.push((var.id, ciphertext, nonce));
+        }
+
+        let (verifier_ct, verifier_nonce) =
+            encrypt(&new_key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+        self.storage.apply_key_rotation(
+            &reencrypted,
+            &salt,
+            &meta.kdf_params,
+            &verifier_ct,
+            &verifier_nonce,
+        )?;
+
+        self.last_session_error = session::save_master_key(&new_key)
+            .err()
+            .map(|e| e.to_string());
+        self.master_key = Some(new_key);
+        Ok(count)
     }
 
     /// Unlock using a key already loaded (e.g. from OS keyring or a local session file).
@@ -736,6 +785,51 @@ mod tests {
             .unwrap();
         let v = app2.get_variable("Fudi", "local", "KEY").unwrap();
         assert_eq!(v.value, "secret-value");
+    }
+
+    #[test]
+    fn rekey_rotates_password_and_reencrypts_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+
+        let mut app = App::open(&db).unwrap();
+        app.init(SecretString::new("old-pass".into())).unwrap();
+        app.create_project("P", None, None, None).unwrap();
+        app.set_variable("P", "local", "secret", "original-value", None)
+            .unwrap();
+        // Full lock/unlock cycle before rekey, like a real session would.
+        app.lock().unwrap();
+        app.unlock(SecretString::new("old-pass".into())).unwrap();
+
+        let before = app.storage.get_vault_meta().unwrap();
+        let count = app.rekey(SecretString::new("new-pass".into())).unwrap();
+        assert_eq!(count, 1);
+
+        // The verifier only accepts the new password from now on.
+        assert!(app
+            .verify_password(SecretString::new("old-pass".into()))
+            .is_err());
+        assert!(app
+            .verify_password(SecretString::new("new-pass".into()))
+            .is_ok());
+
+        // New key domain: salt rotated, KDF cost kept as chosen at init.
+        let after = app.storage.get_vault_meta().unwrap();
+        assert_ne!(after.salt, before.salt);
+        assert_eq!(
+            serde_json::to_string(&after.kdf_params).unwrap(),
+            serde_json::to_string(&before.kdf_params).unwrap()
+        );
+
+        // Close/reopen cycle under the new password decrypts the value.
+        app.lock().unwrap();
+        app.unlock(SecretString::new("new-pass".into())).unwrap();
+        let v = app.get_variable("P", "local", "secret").unwrap();
+        assert_eq!(v.value, "original-value");
+
+        // The sync guard marker is pinned to the new local salt.
+        let marker = SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap();
+        assert_eq!(marker.as_deref(), Some(hex::encode(after.salt).as_str()));
     }
 
     #[test]
