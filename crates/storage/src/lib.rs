@@ -66,6 +66,12 @@ impl SyncState {
         )?;
         Ok(())
     }
+
+    /// Remove a key (no-op when absent); e.g. clearing the rekey marker.
+    pub fn remove(conn: &Connection, key: &str) -> Result<(), StorageError> {
+        conn.execute("DELETE FROM sync_state WHERE key = ?1", params![key])?;
+        Ok(())
+    }
 }
 
 pub struct Storage {

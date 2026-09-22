@@ -25,6 +25,10 @@ pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
 const KEYRING_ACCOUNT_SUPABASE: &str = "supabase-session";
 /// `sync_state` cursor key for incremental pull.
 const CURSOR_KEY: &str = "last_pull";
+/// `sync_state` marker set by `rekey`: hex of the local salt THIS device
+/// rotated. A salt mismatch with this marker present authorizes pushing the
+/// new local vault meta; without it the mismatch aborts the sync.
+pub const PENDING_REKEY_SALT_KEY: &str = "pending_rekey_salt";
 /// Refresh the access token this many seconds before it expires.
 const REFRESH_MARGIN_SECS: u64 = 60;
 
@@ -380,6 +384,44 @@ fn next_cursor(
         })
 }
 
+// ---------- Salt guard (pure) ----------
+
+/// What `sync` must do with the remote vault meta before touching any row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaltAction {
+    /// Server has no vault: push the local meta (first sync from this device).
+    PushLocal,
+    /// Local and remote salts match: proceed with the normal sync.
+    Proceed,
+    /// This device rekeyed (marker matches the local salt): push the new
+    /// local meta first — rows pushed afterwards are encrypted under it.
+    PushRekey,
+    /// Remote key changed elsewhere: abort WITHOUT pushing or pulling.
+    RemoteKeyChanged,
+}
+
+/// Decide how to reconcile local and remote vault salts.
+///
+/// The salt is not secret; it only identifies the key domain. Mixing rows
+/// from two domains leaves ciphertexts nobody can decrypt, so any mismatch
+/// without a matching local rekey marker must stop the sync.
+fn salt_action(
+    local_salt: &[u8],
+    remote_salt_b64: Option<&str>,
+    pending_marker: Option<&str>,
+) -> SaltAction {
+    let Some(remote) = remote_salt_b64 else {
+        return SaltAction::PushLocal;
+    };
+    if remote == b64_encode(local_salt) {
+        return SaltAction::Proceed;
+    }
+    if pending_marker.is_some_and(|m| m == hex::encode(local_salt)) {
+        return SaltAction::PushRekey;
+    }
+    SaltAction::RemoteKeyChanged
+}
+
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
 
 /// Result of merging one pulled row.
@@ -546,29 +588,56 @@ impl App {
         Ok(())
     }
 
-    /// Two-way sync: cascade → push dirty → pull since cursor → LWW merge →
-    /// cascade → persist cursor. Moves ciphertext only.
+    /// Two-way sync: salt guard → cascade → push dirty → pull since cursor →
+    /// LWW merge → cascade → persist cursor. Moves ciphertext only.
     pub async fn sync(&self) -> Result<SyncReport, CoreError> {
         let client = sync_client()?;
         let session = fresh_session(&client).await?;
         let mut report = SyncReport::default();
 
+        // ---- Salt guard: decide BEFORE anything is pushed or pulled. ----
+        // A salt mismatch means two key domains (another device rekeyed, or
+        // this vault was initialized independently); merging rows across them
+        // would corrupt decryption on every device.
+        let remote_vault = client.get_vault(&session).await?;
+        let mut vault_push: Option<(String, String)> = None;
+        let mut clear_rekey_marker = false;
+        if self.storage.is_initialized()? {
+            let meta = self.storage.get_vault_meta()?;
+            let pending = SyncState::get(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
+            let action = salt_action(
+                &meta.salt,
+                remote_vault.as_ref().map(|v| v.salt.as_str()),
+                pending.as_deref(),
+            );
+            match action {
+                SaltAction::Proceed => {}
+                SaltAction::PushLocal | SaltAction::PushRekey => {
+                    vault_push = Some((
+                        b64_encode(&meta.salt),
+                        serde_json::to_string(&meta.kdf_params)?,
+                    ));
+                    clear_rekey_marker = action == SaltAction::PushRekey;
+                }
+                SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
+            }
+        }
+
         // Local-only delete chains (project deleted but children live) would
         // otherwise leave live children under dead parents on the server.
         self.storage.cascade_tombstones(Utc::now())?;
 
-        // ---- Push: vault meta when the server has none, then dirty rows. ----
-        if self.storage.is_initialized()? {
-            let meta = self.storage.get_vault_meta()?;
-            if client.get_vault(&session).await?.is_none() {
-                client
-                    .push_vault(
-                        &session,
-                        &b64_encode(&meta.salt),
-                        &serde_json::to_string(&meta.kdf_params)?,
-                    )
-                    .await?;
-                report.pushed += 1;
+        // ---- Push: vault meta first (rows below are encrypted under the key
+        // it describes), then dirty rows. ----
+        if let Some((salt_b64, kdf_json)) = vault_push {
+            client.push_vault(&session, &salt_b64, &kdf_json).await?;
+            report.pushed += 1;
+            if clear_rekey_marker {
+                // Clear only after the push landed: on network failure the
+                // marker must survive so the next sync can retry. A stale
+                // marker (salts equal) is inert — the guard only reads it on
+                // a mismatch, and the next rekey overwrites it.
+                SyncState::remove(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
             }
         }
 
@@ -891,6 +960,49 @@ mod tests {
         // Cascaded children are dirty → they propagate as tombstones on push.
         assert_eq!(storage.dirty_environments().unwrap().len(), 1);
         assert_eq!(storage.dirty_variables().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn salt_guard_covers_all_four_branches() {
+        let local = [9u8; 16];
+        let local_b64 = b64_encode(&local);
+        let local_hex = hex::encode(local);
+        let other_b64 = b64_encode(&[8u8; 16]);
+
+        // Remote has no vault → push local meta (first sync).
+        assert_eq!(salt_action(&local, None, None), SaltAction::PushLocal);
+        assert_eq!(
+            salt_action(&local, None, Some(&local_hex)),
+            SaltAction::PushLocal
+        );
+
+        // Salts equal → normal sync regardless of a (stale) marker.
+        assert_eq!(
+            salt_action(&local, Some(&local_b64), None),
+            SaltAction::Proceed
+        );
+        assert_eq!(
+            salt_action(&local, Some(&local_b64), Some(&local_hex)),
+            SaltAction::Proceed
+        );
+
+        // Salts differ + marker matches THIS device's salt → rekeyed here:
+        // push the new meta before the rows.
+        assert_eq!(
+            salt_action(&local, Some(&other_b64), Some(&local_hex)),
+            SaltAction::PushRekey
+        );
+
+        // Salts differ, no marker → abort, nothing pushed or pulled.
+        assert_eq!(
+            salt_action(&local, Some(&other_b64), None),
+            SaltAction::RemoteKeyChanged
+        );
+        // A marker for a different salt must not authorize the push.
+        assert_eq!(
+            salt_action(&local, Some(&other_b64), Some("deadbeef")),
+            SaltAction::RemoteKeyChanged
+        );
     }
 
     #[test]

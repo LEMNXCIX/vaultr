@@ -28,6 +28,11 @@ pub enum CoreError {
     InvalidPassword(String),
     #[error("vault is locked")]
     Locked,
+    /// The remote vault salt no longer matches the local one (and this device
+    /// has no pending rekey marker): another device changed the master key,
+    /// or this vault was initialized independently. Nothing was pushed/pulled.
+    #[error("the vault master key changed on another device")]
+    RemoteKeyChanged,
     #[error("project already exists")]
     ProjectExists,
     #[error("project not found")]
