@@ -120,11 +120,16 @@ vault local).
    `vaults.salt`), mismo `kdf_params` vigente. La master key se deriva de la contraseña
    nueva y ese salt.
 3. **Vault local.** Se destruye y se reinicializa: `vault_meta` nuevo (salt nuevo,
-   verifier nuevo bajo la clave nueva, `key_epoch` calculado) y cero filas. Los datos
+   verifier nuevo bajo la clave nueva, `key_epoch` placeholder) y cero filas. Los datos
    locales previos no son recuperables y no se intentan re-cifrar, porque la clave vieja
-   no está disponible. El `key_epoch` local queda en `remote.key_epoch + 1`, o en `1` si
-   la cuenta todavía no tiene fila en `vaults` — en cuyo caso los pasos 4 y 5 se omiten y
-   el reset es puramente local, igual que `--local`.
+   no está disponible.
+
+   El `key_epoch` local es un **placeholder**: `meta.key_epoch + 1` sobre su propio valor,
+   no `remote + 1`. El valor autoritativo se calcula en el push (paso 5), donde la fila
+   remota está a mano: `push_reset` publica `remote.key_epoch + 1`, que es monótono y nunca
+   puede bajar el contador del servidor. Esto es lo que permite que `--local` funcione sin
+   conexión: no necesita conocer el epoch remoto para nada. Tras un push exitoso el valor
+   local converge con el publicado.
 4. **Remoto — sin necesitar la clave.** Se bajan las filas remotas y se vuelven a subir
    como **tombstones**: `deleted = true`, `version + 1`, `updated_at` nuevo, y **el
    `value_encrypted` y el `nonce` originales intactos**. Marcar una fila como borrada no
@@ -141,8 +146,17 @@ vault local).
    cualquier `pending_rekey_salt` previo: ambos marcadores describen el estado de la
    clave del vault y el reset los subsume a los dos. Nunca hay más de uno activo.
 
-`--local` hace solo el paso 3 y escribe `pending_local_reset`. El próximo sync con red no
-procede solo: entra por el flujo de divergencia de la sección 5.
+`--local` hace solo el paso 3 y escribe `pending_local_reset`. El próximo sync con red
+**termina el borrado él mismo, en silencio y sin prompt**: el guard de salt corre después
+del retry, así que al terminar el wipe los salts ya coinciden y resuelve `Proceed`.
+
+> **Nota de implementación (2026-10-02).** Una versión anterior de este spec decía que el
+> epoch local era `remote + 1` al resetear, y que tras un `--local` el sync "entraba por el
+> flujo de divergencia" de la sección 5. Ambas cosas resultaron incorrectas. Preguntarle al
+> autor de un reset por el vault que acaba de crear es un dead-end de UX: el prompt ofrece
+> descartar o conservar datos que él mismo acaba de borrar. La implementación terminada usa
+> el placeholder local y resuelve el wipe en el mismo sync, sin preguntar nada. El flujo de
+> divergencia de la sección 5 queda para el caso real: **otra** PC con el dominio previo.
 
 ### 5. Divergencia en otro dispositivo (opción C)
 
@@ -162,6 +176,16 @@ epoch remoto. La CLI lo traduce a un aviso explícito y ofrece tres salidas:
 Si el motivo es `rekey` en lugar de `reset`, se mantiene el flujo de adopción guiada ya
 existente, que además ahora verifica contra el verifier en vez de contra una fila de
 muestra.
+
+**Precedencia de marcadores.** Solo uno de `pending_rekey_salt` y `pending_local_reset`
+puede estar activo a la vez. `reset_local` limpia el marcador de rekey. En el otro
+sentido, un `rekey` ejecutado mientras hay un reset pendiente **no** crea su propio
+marcador: el reset gana, porque `push_reset` empuja el salt local de todas formas y el
+marcador de rekey no aportaría nada. La alternativa —borrar el marcador de reset desde
+`rekey`— se descartó: un rekey rotó la clave local pero las filas pre-reset del servidor
+siguen cifradas bajo la clave vieja, que **las otras PCs todavía tienen**. Borrar el reset
+ahí dejaría datos vivos en el remoto y mandaría a esas PCs al prompt de adopción, que es
+justo el callejón sin salida que este prompt evita.
 
 Esta es la pieza que evita la resurrección: hoy la adopción es automática e inmediata
 (`crates/cli/src/main.rs:567-582`), así que un dispositivo adopts empuja sus datos viejos
