@@ -556,6 +556,52 @@ fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<
     Ok(())
 }
 
+/// Mark a remote project as deleted for a reset. Pure; unit-testable.
+/// Only metadata changes: a reset has no master key, so the row's contents
+/// are carried through untouched.
+//
+// Not yet wired: the reset orchestrator (follow-up task) is the caller.
+#[allow(dead_code)]
+fn tombstone_project(row: &ProjectRow, now: DateTime<Utc>) -> ProjectRow {
+    ProjectRow {
+        deleted: true,
+        version: row.version + 1,
+        updated_at: Some(now),
+        ..row.clone()
+    }
+}
+
+/// Mark a remote environment as deleted for a reset. Pure; unit-testable.
+/// Only metadata changes (`EnvironmentRow` carries no `version` and none is
+/// added here): a reset has no master key, so the row is carried through
+/// untouched apart from the tombstone markers.
+//
+// Not yet wired: the reset orchestrator (follow-up task) is the caller.
+#[allow(dead_code)]
+fn tombstone_environment(row: &EnvironmentRow, now: DateTime<Utc>) -> EnvironmentRow {
+    EnvironmentRow {
+        deleted: true,
+        updated_at: Some(now),
+        ..row.clone()
+    }
+}
+
+/// Mark a remote variable as deleted for a reset. The ciphertext and nonce
+/// are carried through byte-identical: a reset has no master key, so
+/// re-encrypting is impossible, and a row whose ciphertext changed would no
+/// longer be readable by any device that still holds the old key.
+//
+// Not yet wired: the reset orchestrator (follow-up task) is the caller.
+#[allow(dead_code)]
+fn tombstone_variable(row: &VariableRow, now: DateTime<Utc>) -> VariableRow {
+    VariableRow {
+        deleted: true,
+        version: row.version + 1,
+        updated_at: Some(now),
+        ..row.clone()
+    }
+}
+
 /// Verify a derived key against the remote vault. Prefers the verifier
 /// ciphertext, which works regardless of how many variables exist; falls back
 /// to a sample of variable ciphertexts for vaults predating the verifier
@@ -1160,6 +1206,87 @@ mod tests {
         // Cascaded children are dirty → they propagate as tombstones on push.
         assert_eq!(storage.dirty_environments().unwrap().len(), 1);
         assert_eq!(storage.dirty_variables().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tombstoning_preserves_ciphertext_byte_for_byte() {
+        let now = ts(0);
+        let row = VariableRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000001".into(),
+            environment_id: "018f0000-0000-7000-8000-000000000002".into(),
+            key: "SECRET".into(),
+            value_encrypted: b64_encode(b"opaque-ciphertext"),
+            nonce: b64_encode(b"opaque-nonce-24-bytes-xx"),
+            notes: Some("keep me".into()),
+            is_readonly: true,
+            allow_export: false,
+            deleted: false,
+            version: 4,
+            updated_at: None,
+        };
+
+        let dead = tombstone_variable(&row, now);
+        assert!(dead.deleted);
+        assert_eq!(dead.version, 5);
+        assert_eq!(dead.updated_at, Some(now));
+        assert_eq!(
+            dead.value_encrypted, row.value_encrypted,
+            "ciphertext must survive"
+        );
+        assert_eq!(dead.nonce, row.nonce, "nonce must survive");
+        assert_eq!(dead.key, row.key);
+        assert_eq!(dead.notes, row.notes);
+        assert_eq!(dead.owner_id, row.owner_id);
+        assert_eq!(dead.is_readonly, row.is_readonly);
+        assert_eq!(dead.allow_export, row.allow_export);
+    }
+
+    #[test]
+    fn tombstoning_project_and_environment_preserves_fields() {
+        let now = ts(0);
+
+        let project = ProjectRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000003".into(),
+            name: "P".into(),
+            description: Some("keep me".into()),
+            color: Some("red".into()),
+            icon: None,
+            deleted: false,
+            version: 2,
+            updated_at: None,
+        };
+        let dead_project = tombstone_project(&project, now);
+        assert!(dead_project.deleted);
+        assert_eq!(dead_project.version, 3);
+        assert_eq!(dead_project.updated_at, Some(now));
+        assert_eq!(dead_project.name, project.name);
+        assert_eq!(dead_project.description, project.description);
+        assert_eq!(dead_project.color, project.color);
+        assert_eq!(dead_project.icon, project.icon);
+        assert_eq!(dead_project.owner_id, project.owner_id);
+
+        // EnvironmentRow carries no `version`: only `deleted`/`updated_at`
+        // may change, everything else survives.
+        let env = EnvironmentRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000004".into(),
+            project_id: project.id.clone(),
+            name: "local".into(),
+            is_default: true,
+            sort_order: 7,
+            deleted: false,
+            updated_at: None,
+        };
+        let dead_env = tombstone_environment(&env, now);
+        assert!(dead_env.deleted);
+        assert_eq!(dead_env.updated_at, Some(now));
+        assert_eq!(dead_env.project_id, env.project_id);
+        assert_eq!(dead_env.name, env.name);
+        assert_eq!(dead_env.is_default, env.is_default);
+        assert_eq!(dead_env.sort_order, env.sort_order);
+        assert_eq!(dead_env.owner_id, env.owner_id);
     }
 
     fn salt_inputs<'a>(
