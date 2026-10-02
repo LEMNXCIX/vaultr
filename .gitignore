@@ -43,3 +43,7 @@ vault-backup.enc
 
 # Local agent / tool state
 .direnv/
+
+# Git worktrees (agent isolation)
+.worktrees/
+.superpowers/
