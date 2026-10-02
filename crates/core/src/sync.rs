@@ -448,6 +448,30 @@ fn needs_verifier_backfill(action: SaltAction, remote: Option<&VaultRow>) -> boo
         && remote.is_some_and(|v| v.verifier_ct.is_none() && v.verifier_nonce.is_none())
 }
 
+// ---------- Pending reset (pure) ----------
+
+/// What a pending local reset must do before the salt guard runs, given the
+/// remote state the caller already fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingResetPlan {
+    /// A `vaults` row exists: run the wipe, then re-read the remote meta.
+    Wipe,
+    /// No `vaults` row: there is nothing to wipe, so the marker is already
+    /// satisfied. The local vault holds the new domain and the salt guard
+    /// takes `PushLocal` to create the row.
+    AlreadyWiped,
+}
+
+/// Pure decision for [`App::sync`]'s pending-reset branch; the network work it
+/// guards needs HTTP, the choice does not.
+fn plan_pending_reset(remote_vault: Option<&VaultRow>) -> PendingResetPlan {
+    if remote_vault.is_some() {
+        PendingResetPlan::Wipe
+    } else {
+        PendingResetPlan::AlreadyWiped
+    }
+}
+
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
 
 /// Result of merging one pulled row.
@@ -793,15 +817,17 @@ impl App {
     /// tombstone for every row. Needs no master key — a tombstone is a
     /// metadata write and the ciphertext travels through untouched.
     ///
+    /// The metadata pushed is the LOCAL one, read from storage, and only ever
+    /// the local one. The row this replaces describes the domain being wiped:
+    /// pushing its salt, kdf params or verifier would leave the server
+    /// advertising a key domain nobody holds while its rows are tombstoned
+    /// underneath it. This function therefore takes no remote row at all —
+    /// do not "fix" it by reintroducing one.
+    ///
     /// Idempotent: re-running re-tombstones already-dead rows, bumping their
     /// version and `updated_at`, which the LWW merge resolves the same way.
     /// Returns the number of rows tombstoned.
-    async fn push_reset(
-        &self,
-        client: &SyncClient,
-        session: &Session,
-        _remote: &sync::VaultRow,
-    ) -> Result<usize, CoreError> {
+    async fn push_reset(&self, client: &SyncClient, session: &Session) -> Result<usize, CoreError> {
         let meta = self.storage.get_vault_meta()?;
         client
             .push_vault(
@@ -855,11 +881,10 @@ impl App {
         }
         let client = sync_client()?;
         let session = fresh_session(&client).await?;
-        let remote = client
-            .get_vault(&session)
-            .await?
-            .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
-        let count = self.push_reset(&client, &session, &remote).await?;
+        if client.get_vault(&session).await?.is_none() {
+            return Err(CoreError::Other("no vault found on the server".into()));
+        }
+        let count = self.push_reset(&client, &session).await?;
         SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
         Ok(count)
     }
@@ -875,16 +900,35 @@ impl App {
         // A salt mismatch means two key domains (another device rekeyed, or
         // this vault was initialized independently); merging rows across them
         // would corrupt decryption on every device.
-        let remote_vault = client.get_vault(&session).await?;
+        let mut remote_vault = client.get_vault(&session).await?;
         // A reset that was interrupted before its remote wipe landed must be
         // finished first. Left to the salt guard it would abort with
         // RemoteKeyChanged forever, since the local salt has already moved.
         if self.pending_reset()? {
-            if let Some(remote) = remote_vault.as_ref() {
-                let count = self.push_reset(&client, &session, remote).await?;
-                report.pushed += count + 1;
-                SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
+            match plan_pending_reset(remote_vault.as_ref()) {
+                PendingResetPlan::Wipe => {
+                    let count = self.push_reset(&client, &session).await?;
+                    report.pushed += count + 1;
+                    // Re-read the vault meta: the snapshot above predates the
+                    // wipe, so the salt guard would compare the NEW local salt
+                    // against the OLD remote salt and abort this very sync.
+                    // For a user who just reset because they lost the password
+                    // that abort is a dead end — `vltr sync` would prompt for
+                    // the remote master password and fail to adopt it. After
+                    // the refetch the guard sees post-wipe data, resolves to
+                    // `Proceed`, and the sync that landed the wipe also
+                    // completes and reports success.
+                    remote_vault = client.get_vault(&session).await?;
+                }
+                PendingResetPlan::AlreadyWiped => {}
             }
+            // Cleared exactly once, after either branch. Every failure above
+            // (`push_reset`, the refetch) short-circuits first, so an
+            // interruption always leaves the marker set for the next sync to
+            // retry. With no remote row there was nothing to wipe — the local
+            // vault already is the new domain — so skipping silently here would
+            // strand the marker and re-enter this branch on every future sync.
+            SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
         }
         let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
@@ -1451,6 +1495,73 @@ mod tests {
         assert_eq!(
             variables[0].value_encrypted,
             b64_encode(b"opaque-ciphertext")
+        );
+        assert_eq!(
+            variables[0].nonce,
+            b64_encode(b"opaque-nonce-24-bytes-xx"),
+            "the nonce must survive the tombstone byte-identical too"
+        );
+    }
+
+    fn remote_vault_row() -> VaultRow {
+        VaultRow {
+            owner_id: Some("u".into()),
+            salt: b64_encode(&[9u8; 16]),
+            kdf_params: serde_json::json!({"m_cost": 2048, "t_cost": 1, "p_cost": 1, "output_len": 32}),
+            verifier_ct: Some(b64_encode(b"ct")),
+            verifier_nonce: Some(b64_encode(b"nonce")),
+            key_epoch: 2,
+            key_change: Some(models::constants::KEY_CHANGE_RESET.into()),
+            key_changed_at: None,
+        }
+    }
+
+    #[test]
+    fn pending_reset_wipes_only_when_a_remote_row_exists() {
+        // A remote row is live: the wipe must run, and the marker may only be
+        // cleared once it has.
+        assert_eq!(
+            plan_pending_reset(Some(&remote_vault_row())),
+            PendingResetPlan::Wipe
+        );
+        // No `vaults` row: nothing to wipe, so the marker is already
+        // satisfied and is cleared without any network write.
+        assert_eq!(plan_pending_reset(None), PendingResetPlan::AlreadyWiped);
+    }
+
+    #[test]
+    fn salt_guard_only_proceeds_on_the_post_wipe_vault_meta() {
+        let local = [9u8; 16];
+
+        // The snapshot `sync()` fetched BEFORE `push_reset` ran: the local salt
+        // has already moved, the remote epoch is not ahead, and the rekey
+        // marker is gone (a reset clears it), so the guard aborts. This is the
+        // dead end the post-wipe refetch removes.
+        assert_eq!(
+            salt_action(&SaltInputs {
+                local_salt: &local,
+                local_epoch: 2,
+                remote_salt_b64: Some(&b64_encode(&[4u8; 16])),
+                remote_epoch: Some(2),
+                remote_key_change: Some(models::constants::KEY_CHANGE_INIT),
+                pending_marker: None,
+            }),
+            SaltAction::RemoteKeyChanged
+        );
+
+        // The snapshot taken AFTER the wipe carries the local salt, so the same
+        // sync proceeds and reports success. The reset `key_change` never
+        // reaches the guard: salt equality short-circuits first.
+        assert_eq!(
+            salt_action(&SaltInputs {
+                local_salt: &local,
+                local_epoch: 2,
+                remote_salt_b64: Some(&b64_encode(&local)),
+                remote_epoch: Some(2),
+                remote_key_change: Some(models::constants::KEY_CHANGE_RESET),
+                pending_marker: None,
+            }),
+            SaltAction::Proceed
         );
     }
 
