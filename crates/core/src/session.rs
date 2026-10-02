@@ -92,10 +92,7 @@ fn session_file_path() -> Result<std::path::PathBuf, CoreError> {
     Ok(dir.join("session.json"))
 }
 
-fn save_memory_file(key: &MasterKey) -> Result<(), CoreError> {
-    let path = session_file_path()?;
-    let json = serde_json::to_string(&build_payload(key))
-        .map_err(|e| CoreError::Other(format!("serialize session: {e}")))?;
+pub(crate) fn write_0600(path: &std::path::Path, data: &str) -> Result<(), CoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -104,14 +101,21 @@ fn save_memory_file(key: &MasterKey) -> Result<(), CoreError> {
             .write(true)
             .truncate(true)
             .mode(0o600)
-            .open(&path)?;
-        f.write_all(json.as_bytes())?;
+            .open(path)?;
+        f.write_all(data.as_bytes())?;
         // ponytail: chmod tras crear cubre filesystems que ignoran mode() en create
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
-    std::fs::write(&path, json)?; // Windows: ACLs fuera de scope del MVP
+    std::fs::write(path, data)?; // Windows: ACLs fuera de scope del MVP
     Ok(())
+}
+
+fn save_memory_file(key: &MasterKey) -> Result<(), CoreError> {
+    let path = session_file_path()?;
+    let json = serde_json::to_string(&build_payload(key))
+        .map_err(|e| CoreError::Other(format!("serialize session: {e}")))?;
+    write_0600(&path, &json)
 }
 
 /// Read the session file. Expired or corrupt → delete it and return None.

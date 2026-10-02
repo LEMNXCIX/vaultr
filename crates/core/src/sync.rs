@@ -108,22 +108,7 @@ fn supabase_session_file() -> Result<std::path::PathBuf, CoreError> {
 fn save_supabase_file(stored: &StoredSession) -> Result<(), CoreError> {
     let path = supabase_session_file()?;
     let json = serde_json::to_string(stored).map_err(|e| CoreError::Other(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?;
-        f.write_all(json.as_bytes())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(&path, json)?;
-    Ok(())
+    crate::session::write_0600(&path, &json)
 }
 
 fn load_supabase_file() -> Result<Option<StoredSession>, CoreError> {

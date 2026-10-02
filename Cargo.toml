@@ -59,7 +59,6 @@ tokio = { version = "1", features = ["rt"] }
 clap_complete = "4.5.5"
 arboard = "3.4.0"
 directories = "5.0.1"
-toml = "0.8.14"
 
 # Logging
 tracing = "0.1.40"
