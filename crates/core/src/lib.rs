@@ -1025,6 +1025,55 @@ mod tests {
     }
 
     #[test]
+    fn reset_vault_leaves_no_rows_behind_for_discard() {
+        // The invariant `discard_local_and_adopt` stands on: `reset_vault`
+        // installs the domain and the epoch it is HANDED — a foreign salt, the
+        // remote's counter — instead of generating its own, and no row of the
+        // previous domain survives. That is what makes "discard local" leave
+        // this device aligned with a remote that a reset left empty.
+        let app = unlocked_app();
+        app.create_project("p", None, None, None).unwrap();
+        let env = app.default_environment("p").unwrap();
+        app.set_variable("p", &env.name, "K", "v", None).unwrap();
+        assert!(!app.storage.all_variables().unwrap().is_empty());
+        SyncState::set(
+            app.storage.conn(),
+            sync::PENDING_LOCAL_RESET_KEY,
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+
+        app.storage
+            .reset_vault(
+                &[7u8; 16],
+                &app.storage.get_vault_meta().unwrap().kdf_params,
+                b"ct",
+                b"nonce",
+                5,
+            )
+            .unwrap();
+
+        assert!(app.storage.list_projects().unwrap().is_empty());
+        assert!(app.storage.all_variables().unwrap().is_empty());
+        let meta = app.storage.get_vault_meta().unwrap();
+        assert_eq!(
+            meta.salt,
+            vec![7u8; 16],
+            "adopts the salt it is given, never a fresh one"
+        );
+        assert_eq!(meta.key_epoch, 5, "adopts the remote epoch as-is");
+        // `sync_state` goes too: the pull cursor describes rows this vault no
+        // longer has, and a leftover `pending_local_reset` would make the next
+        // sync wipe the remote a second time.
+        let markers: i64 = app
+            .storage
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 0, "no cursor or marker may survive a discard");
+    }
+
+    #[test]
     fn apply_writes_env_file() {
         let dir = tempfile::tempdir().unwrap();
         let app = unlocked_app();

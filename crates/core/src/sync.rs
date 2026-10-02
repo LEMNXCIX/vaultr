@@ -840,6 +840,75 @@ impl App {
         Ok(())
     }
 
+    /// Discard this device's vault and join the remote's key domain after a
+    /// `RemoteReset` abort — the divergence prompt's "discard local" choice.
+    ///
+    /// The counterpart of [`App::adopt_remote_key`], and deliberately its
+    /// opposite: a reset wiped the remote's live secrets, so re-encrypting this
+    /// device's pre-wipe rows and pushing them back would resurrect exactly what
+    /// the wipe destroyed. Here the local rows are *deleted* instead, and what is
+    /// adopted is the remote's domain, so both devices end up aligned and empty.
+    ///
+    /// `password` must be the one protecting the REMOTE vault: its salt and kdf
+    /// params derive the key, verified against the remote verifier (or a remote
+    /// sample ciphertext in vaults predating the verifier migration) before
+    /// anything local is touched — a wrong password must not be what destroys a
+    /// local vault. The remote's salt, kdf params, verifier and epoch are
+    /// installed as-is: this is not an epoch bump, it is a move to the remote's
+    /// domain, and re-generating either would only re-create the mismatch the
+    /// guard just found.
+    ///
+    /// `pending_local_reset` is cleared: the remote wipe it stands for has
+    /// already landed by the time a device sees this prompt, and a surviving
+    /// marker would have the next sync wipe the remote a second time. (The
+    /// explicit removal is belt-and-braces — `reset_vault` empties `sync_state`
+    /// wholesale — but it keeps the invariant stated where it is relied on.)
+    ///
+    /// Unlike `adopt_remote_key` this never reads `require_key()`: the local
+    /// rows are destroyed, not re-encrypted, so the old in-memory key is
+    /// irrelevant. The new key replaces it and is saved to the session, or the
+    /// stored session would no longer open the vault it now describes.
+    pub async fn discard_local_and_adopt(
+        &mut self,
+        password: SecretString,
+    ) -> Result<(), CoreError> {
+        if !self.storage.is_initialized()? {
+            return Err(CoreError::Other("vault not initialized".into()));
+        }
+        let client = sync_client()?;
+        let session = fresh_session(&client).await?;
+        let remote = client
+            .get_vault(&session)
+            .await?
+            .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
+
+        let salt = b64_decode(&remote.salt)?;
+        let kdf_params: KdfParams = serde_json::from_value(remote.kdf_params.clone())
+            .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
+
+        // Verify BEFORE the wipe: this is the last moment at which a wrong
+        // password can be caught without having destroyed anything.
+        let key = derive_master_key(&password, &salt, &kdf_params)?;
+        verify_key_against_remote(&client, &session, &key, &remote).await?;
+
+        let (verifier_ct, verifier_nonce) =
+            encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+        self.storage.reset_vault(
+            &salt,
+            &kdf_params,
+            &verifier_ct,
+            &verifier_nonce,
+            remote.key_epoch,
+        )?;
+        SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
+
+        self.last_session_error = crate::session::save_master_key(&key)
+            .err()
+            .map(|e| e.to_string());
+        self.master_key = Some(key);
+        Ok(())
+    }
+
     /// Push the remote half of a reset: new vault metadata first, then a
     /// tombstone for every row. Needs no master key — a tombstone is a
     /// metadata write and the ciphertext travels through untouched.

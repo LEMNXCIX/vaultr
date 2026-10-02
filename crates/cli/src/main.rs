@@ -660,6 +660,50 @@ fn main() -> Result<()> {
                         Err(e) => bail!("Sin conexión con Supabase: {e}"),
                     }
                 }
+                Err(vltr_core::CoreError::RemoteReset(info)) => {
+                    eprintln!(
+                        "El vault remoto se reseteó en otro dispositivo \
+                         (key_epoch {}, key_change {}).",
+                        info.remote_epoch,
+                        info.key_change.as_deref().unwrap_or("desconocido"),
+                    );
+                    if let Some(when) = info.key_changed_at {
+                        eprintln!("El cambio de clave se registró el {when}.");
+                    }
+                    eprintln!(
+                        "Un reseteo borra los secretos vivos del vault remoto. Este vault local \
+                         aún conserva los suyos, y nada se ha subido ni bajado."
+                    );
+                    eprintln!("  a) Descartar lo local: se destruye este vault y se adopta el del remoto (vacío en ambos)");
+                    eprintln!("  b) Conservar lo local: se re-cifra con la contraseña del remoto y se vuelve a subir");
+                    eprintln!("  c) Cancelar: no se cambia nada; este vault sigue funcionando, sin sincronizar");
+                    match prompt_divergence_choice()? {
+                        DivergenceChoice::Discard => {
+                            let password = prompt_password("Master password del vault remoto: ")?;
+                            block_on(app.discard_local_and_adopt(password))?;
+                            println!(
+                                "Vault local descartado: ahora vive en el dominio del remoto, \
+                                 vacío en ambos dispositivos."
+                            );
+                            print_session_status(&mut app);
+                        }
+                        DivergenceChoice::Keep => {
+                            let password = prompt_password("Master password del vault remoto: ")?;
+                            block_on(app.adopt_remote_key(password))?;
+                            print_session_status(&mut app);
+                        }
+                        DivergenceChoice::Cancel => {
+                            bail!(
+                                "Sin cambios. Este vault sigue funcionando con su contraseña actual, \
+                                 pero no se sincronizará hasta que decidas qué hacer."
+                            );
+                        }
+                    }
+                    // One retry, never a loop: the choice just aligned this vault
+                    // with the remote, so a second abort is a new event and is
+                    // surfaced instead of retried.
+                    retry_sync_after_divergence(&mut app)?;
+                }
                 Err(e) => bail!("Sin conexión con Supabase: {e}"),
             }
         }
@@ -716,6 +760,75 @@ fn prompt_line_verbatim(prompt: &str) -> Result<String> {
     let line = line.strip_suffix('\n').unwrap_or(&line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     Ok(line.to_owned())
+}
+
+/// Re-run the sync after the divergence prompt resolved the divergence.
+///
+/// Same retry-once shape as the `RemoteKeyChanged` arm, with one addition: a
+/// retry can abort with `RemoteReset` too (another device reset again in
+/// between), and reporting that as a connection failure would be a lie, so it
+/// gets its own message.
+fn retry_sync_after_divergence(app: &mut App) -> Result<()> {
+    match block_on(app.sync()) {
+        Ok(report) => {
+            println!("Sincronización completada: {report}");
+            Ok(())
+        }
+        Err(vltr_core::CoreError::RemoteReset(_)) => {
+            bail!("El remoto se reseteó otra vez; vuelve a intentarlo.")
+        }
+        Err(vltr_core::CoreError::RemoteKeyChanged) => {
+            bail!("El vault remoto cambió de nuevo; vuelve a intentarlo.")
+        }
+        Err(e) => bail!("Sin conexión con Supabase: {e}"),
+    }
+}
+
+/// What to do when a sync finds the remote vault was reset on another device.
+///
+/// `Discard` is the destructive one and is listed first only because it is the
+/// option the reset's author most likely wants; the variant order is not a
+/// safety ranking, and the default is the only choice that loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergenceChoice {
+    /// Destroy the local vault and adopt the remote's key domain, which after a
+    /// reset holds no live secrets. Both devices end up aligned and empty.
+    Discard,
+    /// Re-encrypt this device's rows under the new key and push them, so the
+    /// local data survives the remote's wipe.
+    Keep,
+    /// Change nothing. The local vault keeps working under its old key, just
+    /// unsynced. The default, because it is the only choice that loses nothing.
+    Cancel,
+}
+
+/// Map one answer line to a choice, or `None` to ask again.
+///
+/// Pure, and separate from the prompting, because the rule that matters here is
+/// testable without a TTY: an empty line must be `Cancel`, and an unrecognized
+/// line must re-prompt rather than fall back to *any* default. A default that
+/// resolved to `Discard` on a typo would destroy a vault the user never chose
+/// to discard, so unknown input is deliberately not a choice at all.
+fn divergence_choice(input: &str) -> Option<DivergenceChoice> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "c" | "cancel" => Some(DivergenceChoice::Cancel),
+        "a" | "d" | "discard" => Some(DivergenceChoice::Discard),
+        "b" | "k" | "keep" => Some(DivergenceChoice::Keep),
+        _ => None,
+    }
+}
+
+/// Ask until the answer is one this prompt understands. Only the choice is read
+/// here; the password is asked for afterwards, by the branch that needs it, so
+/// no answer can destroy anything on its own.
+fn prompt_divergence_choice() -> Result<DivergenceChoice> {
+    loop {
+        let answer = prompt_line("Elige [a/b/c] (Enter = cancelar):")?;
+        match divergence_choice(&answer) {
+            Some(choice) => return Ok(choice),
+            None => eprintln!("Opción no reconocida. Responde a, b, c o Enter para cancelar."),
+        }
+    }
 }
 
 /// The reset confirmation phrase, matched exactly: not trimmed, not case-folded,
@@ -964,6 +1077,53 @@ mod tests {
             "RESET IT.",
         ] {
             assert!(!confirmation_matches(rejected), "must reject {rejected:?}");
+        }
+    }
+
+    #[test]
+    fn divergence_choice_defaults_to_cancel() {
+        assert_eq!(divergence_choice(""), Some(DivergenceChoice::Cancel));
+        assert_eq!(divergence_choice("c"), Some(DivergenceChoice::Cancel));
+        assert_eq!(divergence_choice("a"), Some(DivergenceChoice::Discard));
+        assert_eq!(divergence_choice("keep"), Some(DivergenceChoice::Keep));
+        assert_eq!(divergence_choice("maybe"), None, "unknown input re-prompts");
+    }
+
+    #[test]
+    fn divergence_choice_accepts_every_alias_and_ignores_case() {
+        for input in ["a", "d", "discard", "A", "Discard", "  d  "] {
+            assert_eq!(
+                divergence_choice(input),
+                Some(DivergenceChoice::Discard),
+                "must accept {input:?} as discard"
+            );
+        }
+        for input in ["b", "k", "keep", "B", "Keep"] {
+            assert_eq!(
+                divergence_choice(input),
+                Some(DivergenceChoice::Keep),
+                "must accept {input:?} as keep"
+            );
+        }
+        for input in ["c", "cancel", "C", "  "] {
+            assert_eq!(
+                divergence_choice(input),
+                Some(DivergenceChoice::Cancel),
+                "must accept {input:?} as cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn divergence_choice_never_guesses() {
+        // Anything unrecognized must re-prompt, never fall through to a
+        // default: a guess that resolved to Discard would wipe a vault.
+        for input in ["d!", "descartar", "no", "1", "0", "y", "n", "s"] {
+            assert_eq!(
+                divergence_choice(input),
+                None,
+                "must re-prompt on {input:?}, not guess a choice"
+            );
         }
     }
 
