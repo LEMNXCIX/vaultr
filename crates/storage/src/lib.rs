@@ -306,13 +306,21 @@ impl Storage {
         Ok(())
     }
 
-    /// Overwrite the local key epoch. Used by flows that rotate the master key
-    /// without re-encrypting rows (the reset flow in a later plan).
+    /// Overwrite the local key epoch. Used by the reset flow, to converge the
+    /// local counter on the epoch that flow just published; the key rotation
+    /// itself is `reset_vault`'s job, not this method's.
     ///
     /// See `apply_key_rotation`: salt-equality implying epoch-equality is
-    /// load-bearing for the sync verifier-backfill. If a reset flow uses this
-    /// to bump the epoch WITHOUT rotating the salt, it breaks that lock and
-    /// must audit the backfill and the salt guard first.
+    /// load-bearing for the sync verifier-backfill. A caller that moves the
+    /// epoch WITHOUT rotating the salt therefore breaks that lock. That audit
+    /// is done, and it is written down at the `set_key_epoch` call inside
+    /// `core`'s `push_reset` (crates/core/src/sync.rs): the verifier backfill
+    /// needs `Proceed` AND a remote row carrying no verifier, and every reset
+    /// path writes one, so it can never republish a stale epoch over this one;
+    /// and the salt guard reads the epoch only inside the branch where the
+    /// salts already differ, so the write is inert there. Read that comment
+    /// before adding a second such caller — a reset is not a licence to skip
+    /// the question, only the first case that answered it.
     pub fn set_key_epoch(&self, epoch: i64) -> Result<(), StorageError> {
         let n = self.conn.execute(
             "UPDATE vault_meta SET key_epoch = ?1, updated_at = ?2 WHERE id = 1",
@@ -1226,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn adoption_rotation_requeues_parents_and_a_plain_rekey_does_not() {
+    fn adoption_rotation_requeues_parents_and_leaves_their_timestamps_alone() {
         // A device that had already synced before a remote reset: nothing is
         // dirty, which is exactly the state that made the "keep local"
         // adoption push no parents.

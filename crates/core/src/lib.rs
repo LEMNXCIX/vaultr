@@ -162,8 +162,23 @@ impl App {
     /// the rotation transaction: if the transaction fails, the vault is
     /// untouched and the stale marker is inert (the sync guard only consults
     /// it when salts actually differ, and the next rekey overwrites it), so
-    /// no crash window can strand the local vault. Returns the number of
-    /// re-encrypted variables.
+    /// no crash window can strand the local vault.
+    ///
+    /// Any `pending_local_reset` is cleared, so the two markers that
+    /// `reset_local` says only one of which may be active cannot both be.
+    /// This is deliberate, and the reason must not be "tidied up" later: a
+    /// rekey already rotates the salt and bumps the epoch, which supersedes a
+    /// reset that has not been pushed yet — the pre-reset ciphertext is
+    /// unreadable under the new key either way, so the tombstone wipe the
+    /// marker stands for has nothing left to protect. Leaving the marker set
+    /// instead would put this device in a state its own invariant forbids, and
+    /// a stale rekey marker is what would take the `PushRekey` branch over a
+    /// reset once epochs are allowed to tie. The removal happens AFTER the
+    /// rotation lands, for the crash window: a rekey interrupted mid-flight
+    /// leaves both markers, which is today's state and which the next sync
+    /// converges through the pending-reset branch.
+    ///
+    /// Returns the number of re-encrypted variables.
     pub fn rekey(&mut self, new_password: SecretString) -> Result<usize, CoreError> {
         let old_key = self.require_key()?;
         let meta = self.storage.get_vault_meta()?;
@@ -195,6 +210,11 @@ impl App {
             &verifier_nonce,
             meta.key_epoch + 1,
         )?;
+
+        // A rekey supersedes a reset that has not been pushed yet. See this
+        // method's doc for why the marker is dropped rather than kept, and why
+        // it is dropped here and not before the rotation.
+        SyncState::remove(self.storage.conn(), sync::PENDING_LOCAL_RESET_KEY)?;
 
         self.last_session_error = session::save_master_key(&new_key)
             .err()
@@ -245,8 +265,13 @@ impl App {
         // authoritative epoch is `remote + 1`, computed at push time, so a
         // stored epoch here would be a second, wrong answer to a question
         // nobody asks — `pending_reset()` only tests that the marker exists.
-        // The timestamp is what `key_changed_at` should report, since the push
-        // happens on a later sync, not now.
+        //
+        // The timestamp is currently WRITE-ONLY. It is not what
+        // `key_changed_at` reports: `push_reset` and the `PushLocal` that
+        // finishes a reset both stamp `Utc::now()` at push time, and nothing
+        // reads this value back. Wiring it through is a follow-up, not a
+        // comment fix — it would change the metadata the reset publishes, and
+        // that deserves end-to-end coverage this round is not touching.
         SyncState::set(
             self.storage.conn(),
             sync::PENDING_LOCAL_RESET_KEY,
@@ -982,6 +1007,43 @@ mod tests {
             SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn rekey_clears_a_pending_reset_marker() {
+        // The other direction of the "only one marker at a time" invariant
+        // `reset_local` documents, and the one that needs stating: a rekey
+        // between `vltr reset --local` and the next sync used to leave both
+        // markers set.
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        app.reset_local(SecretString::new("second".into())).unwrap();
+        // The rekey needs an unlocked vault; `reset_local` left it unlocked
+        // under the new key, which is what a real `vltr reset` does too.
+        assert!(
+            app.pending_reset().unwrap(),
+            "precondition: reset is pending"
+        );
+
+        app.rekey(SecretString::new("third".into())).unwrap();
+
+        assert_eq!(
+            SyncState::get(app.storage.conn(), sync::PENDING_LOCAL_RESET_KEY).unwrap(),
+            None,
+            "a rekey supersedes a reset that has not been pushed yet"
+        );
+        // The rekey's own marker survives: the rotation did land, so the next
+        // sync must still publish the new salt.
+        let rekey_marker =
+            SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap();
+        let meta = app.storage.get_vault_meta().unwrap();
+        assert_eq!(
+            rekey_marker.as_deref(),
+            Some(hex::encode(meta.salt).as_str()),
+            "the rekey marker must still describe the new local salt"
+        );
+        // init(1) → reset_local(2) → rekey(3).
+        assert_eq!(meta.key_epoch, 3);
     }
 
     #[test]

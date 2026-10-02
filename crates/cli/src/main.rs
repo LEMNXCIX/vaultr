@@ -829,11 +829,16 @@ enum DivergenceChoice {
 /// line must re-prompt rather than fall back to *any* default. A default that
 /// resolved to `Discard` on a typo would destroy a vault the user never chose
 /// to discard, so unknown input is deliberately not a choice at all.
+///
+/// Only the letters the prompt advertises (`[a/b/c]`) and the full words are
+/// accepted. There is no `d`/`k` shorthand: an alias the menu never mentions is
+/// an alias the user cannot see they are using, and on this — the one path that
+/// can destroy a vault — the accepted set is exactly the documented one.
 fn divergence_choice(input: &str) -> Option<DivergenceChoice> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" | "c" | "cancel" => Some(DivergenceChoice::Cancel),
-        "a" | "d" | "discard" => Some(DivergenceChoice::Discard),
-        "b" | "k" | "keep" => Some(DivergenceChoice::Keep),
+        "a" | "discard" => Some(DivergenceChoice::Discard),
+        "b" | "keep" => Some(DivergenceChoice::Keep),
         _ => None,
     }
 }
@@ -1110,15 +1115,15 @@ mod tests {
     }
 
     #[test]
-    fn divergence_choice_accepts_every_alias_and_ignores_case() {
-        for input in ["a", "d", "discard", "A", "Discard", "  d  "] {
+    fn divergence_choice_accepts_the_advertised_letters_and_ignores_case() {
+        for input in ["a", "discard", "A", "Discard", "  a  "] {
             assert_eq!(
                 divergence_choice(input),
                 Some(DivergenceChoice::Discard),
                 "must accept {input:?} as discard"
             );
         }
-        for input in ["b", "k", "keep", "B", "Keep"] {
+        for input in ["b", "keep", "B", "Keep"] {
             assert_eq!(
                 divergence_choice(input),
                 Some(DivergenceChoice::Keep),
@@ -1143,6 +1148,27 @@ mod tests {
                 divergence_choice(input),
                 None,
                 "must re-prompt on {input:?}, not guess a choice"
+            );
+        }
+    }
+
+    #[test]
+    fn divergence_choice_rejects_the_undocumented_shorthand() {
+        // The prompt says `[a/b/c]`. `d` and `k` used to be accepted anyway, and
+        // `d` is a one-keystroke path to the destructive option that the UI
+        // never offers. Not a choice now: re-prompting is the safe direction.
+        for input in ["d", "D", "  d  ", "descartar"] {
+            assert_eq!(
+                divergence_choice(input),
+                None,
+                "{input:?} is not advertised, so it must re-prompt"
+            );
+        }
+        for input in ["k", "K", "  k  "] {
+            assert_eq!(
+                divergence_choice(input),
+                None,
+                "{input:?} is not advertised, so it must re-prompt"
             );
         }
     }

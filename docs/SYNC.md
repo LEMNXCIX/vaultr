@@ -137,7 +137,9 @@ que se abre con la contraseña anterior a ese `rekey`.
   red. Es también la salida cuando no hay sesión de sync — un `vltr reset` sin
   sesión se niega y sugiere `vltr login` o `--local`.
 - **El borrado remoto no necesita la master key.** Un tombstone es una escritura
-  de metadatos: `deleted = true`, `version + 1` y `updated_at` nuevo, con el
+  de metadatos: `deleted = true` y `updated_at` nuevo — más `version + 1` en
+  `projects` y `variables`, que son las dos tablas con columna `version`;
+  `environments` no la tiene y su tombstone solo mueve esos dos campos — con el
   `value_encrypted` y el `nonce` **intactos, byte a byte**. El remoto no se borra
   destruyendo filas, se borra marcándolas, y eso no requiere descifrar nada — que
   es lo que permite resetear un vault cuya clave ya no se tiene. Como en el resto
@@ -146,7 +148,10 @@ que se abre con la contraseña anterior a ese `rekey`.
   epoch se calcula al subir, con la fila remota a mano, así que solo puede
   avanzar el contador del servidor: ni un reset ni el reintento de uno
   interrumpido pueden bajarlo. El contador local converge después en el valor
-  publicado. `key_change` es lo que distingue "cambié la contraseña" de
+  publicado. Si la cuenta todavía no tiene fila en `vaults` no hay epoch remoto
+  al que sumarle, así que la fila la crea el propio sync con el contador local
+  (`reset_local` ya lo avanzó desde el de este vault) y la monotonía se cumple
+  sola. `key_change` es lo que distingue "cambié la contraseña" de
   "reseteé el vault"; sin él, el otro dispositivo no podría saber que debe
   preguntar en vez de adoptar.
 - **Un fallo remoto no es un reset fallido.** Para cuando el vault local ya es el
@@ -333,10 +338,10 @@ limpieza del lado servidor puede requerir un ciclo extra de sync.
 
 Nota sobre los puntos de reset (9-20): son **pasos a ejecutar a mano**, no
 comprobaciones ya hechas. Los caminos HTTP del reset y del prompt a/b/c
-(`push_reset`, `reset_remote`, `discard_local_and_adopt`) no los cubre la suite
-unitaria, que solo fija las partes puras: las tombstones, el epoch publicado, las
-ramas del guard de salt, el parseo de la confirmación y el de la opción, y el
-`reset_vault` de storage. El checklist es la cobertura real de esa parte. Necesitan
-además una cuenta de Supabase usable, y contra el proyecto de test de este repo no
-se pueden ejecutar: GoTrue rechaza el TLD reservado `.test` en
-`e2e@vaultr.test` con `400 email_address_invalid`.
+(`push_reset`, `reset_remote`, `discard_local_and_adopt`, `adopt_remote_key`) no los
+cubre la suite unitaria, que solo fija las partes puras: las tombstones, el epoch
+publicado, las ramas del guard de salt, el parseo de la confirmación y el de la
+opción, y el `reset_vault` de storage. El checklist es la cobertura real de esa
+parte. Necesitan además una cuenta de Supabase usable, y contra el proyecto de
+test de este repo no se pueden ejecutar: GoTrue rechaza el TLD reservado `.test`
+en `e2e@vaultr.test` con `400 email_address_invalid`.
