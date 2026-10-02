@@ -72,9 +72,28 @@ solo pueden compartir cifrado si usan el **mismo salt**; por eso `vaults.salt`
   local contra `vaults.salt` remoto. Si difieren (sin marcador pendiente),
   aborta con `RemoteKeyChanged` **sin tocar nada** — nunca se mezclan dos
   dominios de clave en el remoto.
+- **Verificador remoto:** `vaults` guarda `verifier_ct`/`verifier_nonce`, el
+  ciphertext del mensaje constante `vault-ok` bajo la master key actual. Permite
+  probar la contraseña sin depender de que el vault tenga variables: un vault
+  vacío rechaza igual una contraseña incorrecta. Los vaults anteriores a la
+  migración `0002_key_epoch_verifier` no lo tienen y caen a la verificación por
+  muestra de ciphertext; el primer sync los completa, pero solo cuando los
+  salts coinciden — el backfill corre únicamente con el guard en verde, nunca
+  tras un mismatch. Una fila a medio escribir (con `verifier_ct` pero sin
+  `verifier_nonce`, o al revés) no cae a ese fallback: aborta con error
+  `RemoteVerifierIncomplete` hasta que alguien complete el par.
+- **Key epoch:** `vaults.key_epoch` (y su espejo local, `vault_meta.key_epoch`)
+  sube en cada `rekey` y el motivo del último cambio queda en `key_change`
+  (`init`, `rekey` o `reset`). El epoch solo se compara cuando los salts
+  difieren: un dispositivo cuyo epoch local quedó atrás y cuyo salt ya no
+  coincide aborta el sync en vez de pisar el meta remoto con uno viejo, aunque
+  tenga un `pending_rekey_salt` válido. Si los salts coinciden, el sync sigue
+  adelante sin mirar el epoch — por eso un backup restaurado (salt igual,
+  epoch viejo) continúa sincronizando con normalidad.
 - **Adopción guiada:** tras ese aborto, `vltr sync` pide la contraseña actual
-  del vault remoto, deriva la clave con el salt remoto, la verifica contra un
-  ciphertext de muestra (mismo truco que `bootstrap`), re-cifra todas las
+  del vault remoto, deriva la clave con el salt remoto, la verifica contra el
+  verificador remoto si lo hay (o contra un ciphertext de muestra en vaults
+  antiguos, el mismo truco que `bootstrap`), re-cifra todas las
   variables locales con la nueva clave, reemplaza `vault_meta` local por el
   remoto y continúa con el sync normal. El pull cursor no se toca.
 - **`vltr rekey`** cambia la master password: genera un salt nuevo,
@@ -96,16 +115,31 @@ solo pueden compartir cifrado si usan el **mismo salt**; por eso `vaults.salt`
 - La master key ni el salt del KDF local. Nota: `bootstrap` usa el salt y los
   `kdf_params` remotos de `vaults` para derivar la clave local; el salt no es
   confidencial.
+- El verificador en claro: lo único que llega al server es `vaults.verifier_ct`,
+  el mensaje constante `vault-ok` cifrado con la master key. El servidor solo
+  ve ciphertext de un valor conocido, igual que en cualquier variable, así que
+  el verificador no es un secreto del usuario.
 - Sesiones / keyring.
 - Resolución avanzada de conflictos: LWW por `updated_at` (gana la fila más
   reciente).
+
+> **Limitación conocida:** la policy de `vaults` es `for all`, así que cualquier
+> usuario autenticado de la cuenta puede sobrescribir `salt` y `kdf_params` con
+> solo su contraseña de Supabase, sin conocer la master key. El cliente exige la
+> contraseña correcta para adoptar o pushear el meta del vault, pero esa es una
+> política del cliente, no una garantía del servidor: un atacante con la contraseña
+> de la cuenta puede dejar el vault indescifrable. Si además infla `key_epoch`,
+> el marcador `pending_rekey_salt` no autoriza nada, el sync aborta y ningún
+> `rekey` local escapa de ese aborto: el epoch local sigue por detrás y no hay
+> salida desde el cliente. Cerrarlo requiere mover la
+> validación al servidor con un rol que la CLI no tiene.
 
 ## Checklist de verificación E2E (manual)
 
 Con tu propio proyecto Supabase:
 
 1. Exporta `VAULTR_SUPABASE_URL` y `VAULTR_SUPABASE_KEY`, y aplica
-   `supabase/migrations/0001_init.sql`.
+   `supabase/migrations/0001_init.sql` Y `supabase/migrations/0002_key_epoch_verifier.sql`.
 2. Dispositivo A: `vltr login && vltr sync` (sube el vault al remoto).
 3. Dispositivo B (o directorio limpio): `vltr bootstrap` + master password →
    `vltr ls` debe mostrar los secretos.
@@ -113,6 +147,21 @@ Con tu propio proyecto Supabase:
    gana la edición más reciente (`updated_at`, LWW).
 5. `vltr rm` en B, `vltr sync`, luego `vltr sync` en A → la variable
    desaparece en A.
+6. Vault existente sin verificador (creado antes de `0002_key_epoch_verifier`):
+   `vltr sync` debe completarse y, al consultar `vaults`, `verifier_ct` debe
+   quedar poblado. El backfill reescribe `key_epoch`/`key_change` con valores
+   iguales a los del remoto por construcción (la igualdad de salts hoy implica
+   igualdad de epochs), no los deja intactos.
+7. Con `verifier_ct` poblado: un dispositivo nuevo con la contraseña
+   **incorrecta** debe fallar el `vltr bootstrap` aunque el remoto no tenga
+   ninguna variable.
+8. Tras un `rekey` y un `sync` en A, el `sync` en B debe abortar con
+   `RemoteKeyChanged` y adoptar con la contraseña nueva.
+
+Orden de despliegue: un cliente nuevo exige `0002` ya aplicada — sin esas
+columnas el primer push del meta falla con `PGRST204` (la CLI lo muestra como
+error de conexión). El orden inverso (cliente viejo contra servidor nuevo)
+funciona: el cliente viejo simplemente ignora las columnas nuevas.
 
 Nota sobre deletes: los borrados se propagan como **tombstones**
 (`deleted = true`) y las filas nunca se eliminan físicamente del server; la

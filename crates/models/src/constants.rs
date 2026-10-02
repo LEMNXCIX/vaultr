@@ -37,3 +37,8 @@ pub const ARGON2_M_COST_KIB: u32 = 65_536; // 64 MiB
 pub const ARGON2_T_COST: u32 = 3;
 pub const ARGON2_P_COST: u32 = 4;
 pub const ARGON2_OUTPUT_LEN: usize = 32;
+
+/// `vaults.key_change` values: why `key_epoch` last changed.
+pub const KEY_CHANGE_INIT: &str = "init";
+pub const KEY_CHANGE_REKEY: &str = "rekey";
+pub const KEY_CHANGE_RESET: &str = "reset";

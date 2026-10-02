@@ -34,6 +34,12 @@ pub static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/002_sync_support.sql"),
         disable_foreign_keys: true,
     },
+    Migration {
+        version: 3,
+        name: "003_key_epoch",
+        sql: include_str!("../migrations/003_key_epoch.sql"),
+        disable_foreign_keys: false,
+    },
 ];
 
 const BOOTSTRAP: &str = r#"
@@ -152,6 +158,26 @@ mod tests {
         assert!(is_applied(&conn, 1).unwrap());
         // Idempotent
         run(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
+    }
+
+    #[test]
+    fn key_epoch_defaults_to_one_and_is_writable() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 3);
+
+        conn.execute(
+            "INSERT INTO vault_meta (id, salt, kdf_params, verifier_ct, verifier_nonce, created_at, updated_at, key_epoch)
+             VALUES (1, x'00', '{}', x'00', x'00', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 7)",
+            [],
+        )
+        .unwrap();
+        let epoch: i64 = conn
+            .query_row("SELECT key_epoch FROM vault_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(epoch, 7);
     }
 }

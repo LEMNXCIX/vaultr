@@ -152,7 +152,7 @@ impl Storage {
     pub fn get_vault_meta(&self) -> Result<VaultMeta, StorageError> {
         self.conn
             .query_row(
-                "SELECT salt, kdf_params, verifier_ct, verifier_nonce, created_at, updated_at
+                "SELECT salt, kdf_params, verifier_ct, verifier_nonce, key_epoch, created_at, updated_at
                  FROM vault_meta WHERE id = 1",
                 [],
                 |row| {
@@ -161,20 +161,22 @@ impl Storage {
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()?
             .map(
-                |(salt, params_json, verifier_ct, verifier_nonce, created, updated)| -> Result<VaultMeta, StorageError> {
+                |(salt, params_json, verifier_ct, verifier_nonce, key_epoch, created, updated)| -> Result<VaultMeta, StorageError> {
                     let kdf_params: KdfParams = serde_json::from_str(&params_json)?;
                     Ok(VaultMeta {
                         salt,
                         kdf_params,
                         verifier_ct,
                         verifier_nonce,
+                        key_epoch,
                         created_at: parse_dt(&created),
                         updated_at: parse_dt(&updated),
                     })
@@ -194,6 +196,13 @@ impl Storage {
     /// newer edits from other devices. `synced_at` is cleared so each row
     /// re-enters the dirty set (`synced_at IS NULL OR updated_at > synced_at`)
     /// and the new ciphertext propagates on the next push.
+    ///
+    /// Load-bearing for sync: every key-epoch bump today also rotates the
+    /// salt (`rekey` generates a fresh salt; remote-key adoption copies the
+    /// remote one), so salt-equality currently implies epoch-equality. The
+    /// sync verifier-backfill relies on that. A future reset flow that bumps
+    /// the epoch WITHOUT rotating the salt must audit the backfill and the
+    /// salt guard first.
     pub fn apply_key_rotation(
         &self,
         reencrypted: &[(Id, Vec<u8>, Vec<u8>)],
@@ -201,6 +210,7 @@ impl Storage {
         kdf_params: &KdfParams,
         verifier_ct: &[u8],
         verifier_nonce: &[u8],
+        key_epoch: i64,
     ) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         for (id, ciphertext, nonce) in reencrypted {
@@ -219,13 +229,14 @@ impl Storage {
         let params_json = serde_json::to_string(kdf_params)?;
         let updated = tx.execute(
             "UPDATE vault_meta
-             SET salt = ?1, kdf_params = ?2, verifier_ct = ?3, verifier_nonce = ?4, updated_at = ?5
+             SET salt = ?1, kdf_params = ?2, verifier_ct = ?3, verifier_nonce = ?4, key_epoch = ?5, updated_at = ?6
              WHERE id = 1",
             params![
                 salt,
                 params_json,
                 verifier_ct,
                 verifier_nonce,
+                key_epoch,
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -233,6 +244,24 @@ impl Storage {
             return Err(StorageError::NotInitialized);
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Overwrite the local key epoch. Used by flows that rotate the master key
+    /// without re-encrypting rows (the reset flow in a later plan).
+    ///
+    /// See `apply_key_rotation`: salt-equality implying epoch-equality is
+    /// load-bearing for the sync verifier-backfill. If a reset flow uses this
+    /// to bump the epoch WITHOUT rotating the salt, it breaks that lock and
+    /// must audit the backfill and the salt guard first.
+    pub fn set_key_epoch(&self, epoch: i64) -> Result<(), StorageError> {
+        let n = self.conn.execute(
+            "UPDATE vault_meta SET key_epoch = ?1, updated_at = ?2 WHERE id = 1",
+            params![epoch, Utc::now().to_rfc3339()],
+        )?;
+        if n == 0 {
+            return Err(StorageError::NotInitialized);
+        }
         Ok(())
     }
 
@@ -1138,6 +1167,7 @@ mod tests {
             &KdfParams::default(),
             b"ct2",
             b"nonce2",
+            2,
         )
         .unwrap();
 
@@ -1162,6 +1192,15 @@ mod tests {
         assert_eq!(s.all_variables().unwrap().len(), 1);
         assert!(s.delete_variable(e.id, "K").unwrap());
         assert_eq!(s.all_variables().unwrap().len(), 1, "tombstones included");
+    }
+
+    #[test]
+    fn set_key_epoch_on_uninitialized_vault_errors() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(matches!(
+            s.set_key_epoch(2),
+            Err(StorageError::NotInitialized)
+        ));
     }
 
     #[test]
@@ -1193,7 +1232,7 @@ mod tests {
         .unwrap();
 
         migrations::run(&conn).unwrap();
-        assert_eq!(migrations::current_version(&conn).unwrap(), 2);
+        assert_eq!(migrations::current_version(&conn).unwrap(), 3);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM variables", [], |r| r.get(0))

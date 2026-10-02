@@ -18,6 +18,8 @@ pub struct VaultMeta {
     /// AEAD ciphertext used to verify the master password on unlock.
     pub verifier_ct: Vec<u8>,
     pub verifier_nonce: Vec<u8>,
+    /// Monotonic counter of master-key changes, mirrored from `vaults.key_epoch`.
+    pub key_epoch: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

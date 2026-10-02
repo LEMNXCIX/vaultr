@@ -17,7 +17,7 @@ use storage::{Storage, SyncState, SyncTable};
 
 use crate::{App, CoreError};
 use crypto::{decrypt, derive_master_key, encrypt, MasterKey};
-use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow};
+use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow, VaultMetaPush, VaultRow};
 
 pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
 pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
@@ -488,21 +488,42 @@ enum SaltAction {
 /// The salt is not secret; it only identifies the key domain. Mixing rows
 /// from two domains leaves ciphertexts nobody can decrypt, so any mismatch
 /// without a matching local rekey marker must stop the sync.
-fn salt_action(
-    local_salt: &[u8],
-    remote_salt_b64: Option<&str>,
-    pending_marker: Option<&str>,
-) -> SaltAction {
-    let Some(remote) = remote_salt_b64 else {
+/// Local and remote vault state, gathered by the caller so this stays pure.
+struct SaltInputs<'a> {
+    local_salt: &'a [u8],
+    local_epoch: i64,
+    remote_salt_b64: Option<&'a str>,
+    remote_epoch: Option<i64>,
+    pending_marker: Option<&'a str>,
+}
+
+fn salt_action(i: &SaltInputs) -> SaltAction {
+    let Some(remote) = i.remote_salt_b64 else {
         return SaltAction::PushLocal;
     };
-    if remote == b64_encode(local_salt) {
+    if remote == b64_encode(i.local_salt) {
         return SaltAction::Proceed;
     }
-    if pending_marker.is_some_and(|m| m == hex::encode(local_salt)) {
+    // Salt differs. A remote that has rotated past us wins even when this
+    // device holds a pending rekey marker: our meta is stale and pushing it
+    // would clobber a newer key domain.
+    if i.remote_epoch.is_some_and(|re| re > i.local_epoch) {
+        return SaltAction::RemoteKeyChanged;
+    }
+    if i.pending_marker
+        .is_some_and(|m| m == hex::encode(i.local_salt))
+    {
         return SaltAction::PushRekey;
     }
     SaltAction::RemoteKeyChanged
+}
+
+/// True when the remote vault shares our key domain but predates the verifier
+/// migration, so this sync should fill in the verifier. Deliberately only for
+/// `Proceed`: a salt mismatch must abort before anything is written.
+fn needs_verifier_backfill(action: SaltAction, remote: Option<&VaultRow>) -> bool {
+    matches!(action, SaltAction::Proceed)
+        && remote.is_some_and(|v| v.verifier_ct.is_none() && v.verifier_nonce.is_none())
 }
 
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
@@ -569,6 +590,33 @@ fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, 
 
 // ---------- App methods ----------
 
+/// Decide how to verify a derived key against the remote vault, given what
+/// the `vaults` row carries. Pure; unit-testable without HTTP.
+///
+/// A complete verifier pair is the strongest signal: it is independent of the
+/// vault's contents, so an empty vault still rejects a wrong password. A row
+/// written before the verifier migration has neither field and falls back to
+/// the sample. A verifier without a nonce is a half-written row and must not
+/// be mistaken for "no verifier".
+#[allow(clippy::type_complexity)]
+fn verifier_parts(vault: &VaultRow) -> Result<Option<(Vec<u8>, Vec<u8>)>, CoreError> {
+    match (&vault.verifier_ct, &vault.verifier_nonce) {
+        (None, None) => Ok(None),
+        (Some(ct), Some(nonce)) => Ok(Some((b64_decode(ct)?, b64_decode(nonce)?))),
+        _ => Err(CoreError::RemoteVerifierIncomplete),
+    }
+}
+
+/// Verify a master key against the remote verifier ciphertext.
+fn verify_verifier(key: &MasterKey, ct: &[u8], nonce: &[u8]) -> Result<(), CoreError> {
+    let plaintext = decrypt(key, ct, nonce).map_err(|_| CoreError::invalid_password())?;
+    if plaintext.as_str() == models::constants::VAULT_VERIFIER_MESSAGE {
+        Ok(())
+    } else {
+        Err(CoreError::invalid_password())
+    }
+}
+
 /// Verify a derived key against a sample of remote variable ciphertexts.
 /// Prefers a live row, falling back to any row (tombstones still carry a
 /// ciphertext). An empty sample — remote exists but has no variables yet —
@@ -591,12 +639,19 @@ fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<
     Ok(())
 }
 
-/// Pull one page of remote variables and verify `key` against a sample.
-async fn verify_password_against_remote(
+/// Verify a derived key against the remote vault. Prefers the verifier
+/// ciphertext, which works regardless of how many variables exist; falls back
+/// to a sample of variable ciphertexts for vaults predating the verifier
+/// migration. A wrong password yields `CoreError::InvalidPassword`.
+async fn verify_key_against_remote(
     client: &SyncClient,
     session: &Session,
     key: &MasterKey,
+    vault: &VaultRow,
 ) -> Result<(), CoreError> {
+    if let Some((ct, nonce)) = verifier_parts(vault)? {
+        return verify_verifier(key, &ct, &nonce);
+    }
     let sample = client
         .pull_page::<VariableRow>(session, "variables")
         .await?;
@@ -687,18 +742,19 @@ impl App {
             .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
 
         let salt = b64_decode(&vault.salt)?;
-        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
+        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params.clone())
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
         // No verifier travels over the wire; derive locally and verify
         // against a real remote ciphertext before touching the local vault.
         let key = derive_master_key(&password, &salt, &kdf_params)?;
-        verify_password_against_remote(&client, &session, &key).await?;
+        verify_key_against_remote(&client, &session, &key, &vault).await?;
 
         let (verifier_ct, verifier_nonce) =
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
             .init_vault(&salt, &kdf_params, &verifier_ct, &verifier_nonce)?;
+        self.storage.set_key_epoch(vault.key_epoch)?;
         self.master_key = Some(key);
         Ok(())
     }
@@ -706,8 +762,9 @@ impl App {
     /// Adopt the remote vault's key after a `RemoteKeyChanged` abort.
     ///
     /// `password` must be the one currently protecting the REMOTE vault: its
-    /// salt + kdf params derive the new key, verified against a remote sample
-    /// ciphertext before anything local is touched. Every local variable is
+    /// salt + kdf params derive the new key, verified against the remote
+    /// verifier ciphertext (or a remote sample ciphertext in vaults predating
+    /// the verifier migration) before anything local is touched. Every local variable is
     /// then re-encrypted under that key (the old in-memory key decrypts the
     /// local rows — the independent-init case included) and `vault_meta` is
     /// replaced by the remote one, so the next sync finds matching salts.
@@ -726,11 +783,11 @@ impl App {
             .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
 
         let remote_salt = b64_decode(&vault.salt)?;
-        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
+        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params.clone())
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
         let new_key = derive_master_key(&password, &remote_salt, &kdf_params)?;
-        verify_password_against_remote(&client, &session, &new_key).await?;
+        verify_key_against_remote(&client, &session, &new_key, &vault).await?;
 
         let old_key = self.require_key()?;
         let variables = self.storage.all_variables()?;
@@ -749,6 +806,7 @@ impl App {
             &kdf_params,
             &verifier_ct,
             &verifier_nonce,
+            vault.key_epoch,
         )?;
 
         self.last_session_error = crate::session::save_master_key(self.storage.db_path(), &new_key)
@@ -770,24 +828,41 @@ impl App {
         // this vault was initialized independently); merging rows across them
         // would corrupt decryption on every device.
         let remote_vault = client.get_vault(&session).await?;
-        let mut vault_push: Option<(String, String)> = None;
+        let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
+        let mut salt_action_taken = SaltAction::Proceed;
         if self.storage.is_initialized()? {
             let meta = self.storage.get_vault_meta()?;
             let pending = SyncState::get(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
-            let action = salt_action(
-                &meta.salt,
-                remote_vault.as_ref().map(|v| v.salt.as_str()),
-                pending.as_deref(),
-            );
-            match action {
+            let inputs = SaltInputs {
+                local_salt: &meta.salt,
+                local_epoch: meta.key_epoch,
+                remote_salt_b64: remote_vault.as_ref().map(|v| v.salt.as_str()),
+                remote_epoch: remote_vault.as_ref().map(|v| v.key_epoch),
+                pending_marker: pending.as_deref(),
+            };
+            salt_action_taken = salt_action(&inputs);
+            match salt_action_taken {
                 SaltAction::Proceed => {}
                 SaltAction::PushLocal | SaltAction::PushRekey => {
-                    vault_push = Some((
-                        b64_encode(&meta.salt),
-                        serde_json::to_string(&meta.kdf_params)?,
-                    ));
-                    clear_rekey_marker = action == SaltAction::PushRekey;
+                    vault_push = Some(VaultMetaPush {
+                        salt: b64_encode(&meta.salt),
+                        kdf_params: serde_json::to_value(&meta.kdf_params)?,
+                        verifier_ct: Some(b64_encode(&meta.verifier_ct)),
+                        verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
+                        key_epoch: meta.key_epoch,
+                        key_change: if salt_action_taken == SaltAction::PushRekey {
+                            models::constants::KEY_CHANGE_REKEY.into()
+                        } else {
+                            models::constants::KEY_CHANGE_INIT.into()
+                        },
+                        key_changed_at: if salt_action_taken == SaltAction::PushRekey {
+                            Some(Utc::now().to_rfc3339())
+                        } else {
+                            None
+                        },
+                    });
+                    clear_rekey_marker = salt_action_taken == SaltAction::PushRekey;
                 }
                 SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
             }
@@ -799,8 +874,8 @@ impl App {
 
         // ---- Push: vault meta first (rows below are encrypted under the key
         // it describes), then dirty rows. ----
-        if let Some((salt_b64, kdf_json)) = vault_push {
-            client.push_vault(&session, &salt_b64, &kdf_json).await?;
+        if let Some(push) = &vault_push {
+            client.push_vault(&session, push).await?;
             report.pushed += 1;
             if clear_rekey_marker {
                 // Clear only after the push landed: on network failure the
@@ -809,6 +884,40 @@ impl App {
                 // a mismatch, and the next rekey overwrites it.
                 SyncState::remove(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
             }
+        }
+
+        // Backfill: this vault predates the verifier migration. Completing the
+        // verifier makes the next device's password check real. `push_vault`
+        // upserts a complete `VaultRow` body (`resolution=merge-duplicates`),
+        // so this ALSO rewrites `key_epoch`, `key_change` and `key_changed_at`
+        // — not just the additive verifier fields. That rewrite is safe only
+        // because the guard compared salts first: every epoch bump today also
+        // rotates the salt, so salt-equality currently implies epoch-equality
+        // and the rewritten values equal the remote's. The verifier is
+        // encrypted under the LOCAL key, so the LOCAL `kdf_params` it was
+        // derived from travel with it — never echo the remote params here.
+        if needs_verifier_backfill(salt_action_taken, remote_vault.as_ref()) {
+            let meta = self.storage.get_vault_meta()?;
+            let key = self.require_key()?;
+            let (ct, nonce) = encrypt(key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+            let remote = remote_vault
+                .as_ref()
+                .expect("needs_verifier_backfill guarantees a remote vault is present");
+            client
+                .push_vault(
+                    &session,
+                    &VaultMetaPush {
+                        salt: remote.salt.clone(),
+                        kdf_params: serde_json::to_value(&meta.kdf_params)?,
+                        verifier_ct: Some(b64_encode(&ct)),
+                        verifier_nonce: Some(b64_encode(&nonce)),
+                        key_epoch: meta.key_epoch,
+                        key_change: models::constants::KEY_CHANGE_INIT.into(),
+                        key_changed_at: None,
+                    },
+                )
+                .await?;
+            report.pushed += 1;
         }
 
         let projects = self.storage.dirty_projects()?;
@@ -1132,6 +1241,20 @@ mod tests {
         assert_eq!(storage.dirty_variables().unwrap().len(), 1);
     }
 
+    fn salt_inputs<'a>(
+        local: &'a [u8],
+        remote: Option<&'a str>,
+        marker: Option<&'a str>,
+    ) -> SaltInputs<'a> {
+        SaltInputs {
+            local_salt: local,
+            local_epoch: 1,
+            remote_salt_b64: remote,
+            remote_epoch: None,
+            pending_marker: marker,
+        }
+    }
+
     #[test]
     fn salt_guard_covers_all_four_branches() {
         let local = [9u8; 16];
@@ -1140,39 +1263,86 @@ mod tests {
         let other_b64 = b64_encode(&[8u8; 16]);
 
         // Remote has no vault → push local meta (first sync).
-        assert_eq!(salt_action(&local, None, None), SaltAction::PushLocal);
         assert_eq!(
-            salt_action(&local, None, Some(&local_hex)),
+            salt_action(&salt_inputs(&local, None, None)),
+            SaltAction::PushLocal
+        );
+        assert_eq!(
+            salt_action(&salt_inputs(&local, None, Some(&local_hex))),
             SaltAction::PushLocal
         );
 
         // Salts equal → normal sync regardless of a (stale) marker.
         assert_eq!(
-            salt_action(&local, Some(&local_b64), None),
+            salt_action(&salt_inputs(&local, Some(&local_b64), None)),
             SaltAction::Proceed
         );
         assert_eq!(
-            salt_action(&local, Some(&local_b64), Some(&local_hex)),
+            salt_action(&salt_inputs(&local, Some(&local_b64), Some(&local_hex))),
             SaltAction::Proceed
         );
 
         // Salts differ + marker matches THIS device's salt → rekeyed here:
         // push the new meta before the rows.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), Some(&local_hex)),
+            salt_action(&salt_inputs(&local, Some(&other_b64), Some(&local_hex))),
             SaltAction::PushRekey
         );
 
         // Salts differ, no marker → abort, nothing pushed or pulled.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), None),
+            salt_action(&salt_inputs(&local, Some(&other_b64), None)),
             SaltAction::RemoteKeyChanged
         );
         // A marker for a different salt must not authorize the push.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), Some("deadbeef")),
+            salt_action(&salt_inputs(&local, Some(&other_b64), Some("deadbeef"))),
             SaltAction::RemoteKeyChanged
         );
+    }
+
+    #[test]
+    fn remote_epoch_ahead_blocks_a_stale_local_rekey() {
+        // This device rekeyed and has a pending marker, but the remote has
+        // since rotated again. Pushing our stale meta would clobber it.
+        let local = [1u8; 16];
+        let local_hex = hex::encode(local);
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 2,
+            remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
+            remote_epoch: Some(3),
+            pending_marker: Some(&local_hex),
+        };
+        assert_eq!(salt_action(&i), SaltAction::RemoteKeyChanged);
+    }
+
+    #[test]
+    fn remote_epoch_ahead_with_matching_salt_still_proceeds() {
+        // Salts match, so the key domains agree; a higher remote epoch is
+        // bookkeeping, not a reason to abort.
+        let local = [1u8; 16];
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 1,
+            remote_salt_b64: Some(&b64_encode(&local)),
+            remote_epoch: Some(9),
+            pending_marker: None,
+        };
+        assert_eq!(salt_action(&i), SaltAction::Proceed);
+    }
+
+    #[test]
+    fn remote_epoch_behind_does_not_block_our_newer_rekey() {
+        let local = [1u8; 16];
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 5,
+            remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
+            remote_epoch: Some(4),
+            pending_marker: Some(&hex::encode(local)),
+        };
+        assert_eq!(salt_action(&i), SaltAction::PushRekey);
     }
 
     #[test]
@@ -1348,6 +1518,98 @@ mod tests {
         let mut tombstone = row;
         tombstone.deleted = true;
         assert!(verify_key_against_sample(&good_key, &[tombstone]).is_ok());
+    }
+
+    fn vault_row_with_verifier(key: &MasterKey) -> VaultRow {
+        let (ct, nonce) = encrypt(key, models::constants::VAULT_VERIFIER_MESSAGE).unwrap();
+        VaultRow {
+            owner_id: None,
+            salt: "c2FsdA==".into(),
+            kdf_params: serde_json::json!({"m_cost": 2048, "t_cost": 1, "p_cost": 1, "output_len": 32}),
+            verifier_ct: Some(b64_encode(&ct)),
+            verifier_nonce: Some(b64_encode(&nonce)),
+            key_epoch: 1,
+            key_change: Some("init".into()),
+            key_changed_at: None,
+        }
+    }
+
+    fn test_keys() -> (MasterKey, MasterKey, KdfParams, Vec<u8>) {
+        let params = KdfParams {
+            m_cost: 2048,
+            t_cost: 1,
+            p_cost: 1,
+            output_len: 32,
+        };
+        let salt = vec![9u8; 16];
+        let good =
+            derive_master_key(&SecretString::new("correct-horse".into()), &salt, &params).unwrap();
+        let bad = derive_master_key(&SecretString::new("wrong".into()), &salt, &params).unwrap();
+        (good, bad, params, salt)
+    }
+
+    #[test]
+    fn verifier_accepts_only_the_right_key() {
+        let (good, bad, _, _) = test_keys();
+        let row = vault_row_with_verifier(&good);
+        let (ct, nonce) = (
+            b64_decode(row.verifier_ct.as_ref().unwrap()).unwrap(),
+            b64_decode(row.verifier_nonce.as_ref().unwrap()).unwrap(),
+        );
+        assert!(verify_verifier(&good, &ct, &nonce).is_ok());
+        assert!(matches!(
+            verify_verifier(&bad, &ct, &nonce),
+            Err(CoreError::InvalidPassword(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_ciphertext_of_the_wrong_constant() {
+        // Right key, but the row was encrypted over some other plaintext: the
+        // AEAD tag passes yet the message must not match.
+        let (good, _, _, _) = test_keys();
+        let (ct, nonce) = encrypt(&good, "some-other-value").unwrap();
+        assert!(matches!(
+            verify_verifier(&good, &ct, &nonce),
+            Err(CoreError::InvalidPassword(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_row_without_nonce_is_an_explicit_error() {
+        let (good, _, _, _) = test_keys();
+        let mut row = vault_row_with_verifier(&good);
+        row.verifier_nonce = None;
+        assert!(matches!(
+            verifier_parts(&row),
+            Err(CoreError::RemoteVerifierIncomplete)
+        ));
+    }
+
+    #[test]
+    fn backfill_only_on_matching_domain_without_verifier() {
+        let key = test_keys().0;
+        let mut old_row = vault_row_with_verifier(&key);
+        old_row.verifier_ct = None;
+        old_row.verifier_nonce = None;
+
+        assert!(needs_verifier_backfill(SaltAction::Proceed, Some(&old_row)));
+        assert!(
+            !needs_verifier_backfill(SaltAction::Proceed, None),
+            "no remote vault: the first push already carries the verifier"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::RemoteKeyChanged, Some(&old_row)),
+            "a salt mismatch must abort, never write"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::PushRekey, Some(&old_row)),
+            "a rekey push already carries a verifier"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::Proceed, Some(&vault_row_with_verifier(&key))),
+            "already has a verifier"
+        );
     }
 
     #[test]

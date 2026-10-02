@@ -8,7 +8,8 @@ mod dto;
 pub use auth::Session;
 pub use dto::{EnvironmentRow, ProjectRow, VariableRow, VaultRow};
 
-use serde::{de::DeserializeOwned, Serialize};
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -28,6 +29,19 @@ pub struct SyncClient {
     http: reqwest::Client,
     base_url: String,
     anon_key: String,
+}
+
+/// Body sent to `vaults`. A struct rather than a parameter list: the row has
+/// enough fields that positional args stop being readable at the call site.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VaultMetaPush {
+    pub salt: String,
+    pub kdf_params: serde_json::Value,
+    pub verifier_ct: Option<String>,
+    pub verifier_nonce: Option<String>,
+    pub key_epoch: i64,
+    pub key_change: String,
+    pub key_changed_at: Option<String>,
 }
 
 impl SyncClient {
@@ -51,18 +65,24 @@ impl SyncClient {
     }
 
     /// Upsert into `vaults` keyed by `owner_id` (its primary key).
-    pub async fn push_vault(
-        &self,
-        session: &Session,
-        salt_b64: &str,
-        kdf_params_json: &str,
-    ) -> Result<()> {
-        let row = VaultRow {
+    pub async fn push_vault(&self, session: &Session, meta: &VaultMetaPush) -> Result<()> {
+        let mut row = VaultRow {
             owner_id: Some(session.user_id.clone()),
-            salt: salt_b64.to_string(),
-            kdf_params: serde_json::from_str(kdf_params_json)
-                .map_err(|e| SyncError::Config(format!("invalid kdf params json: {e}")))?,
+            salt: meta.salt.clone(),
+            kdf_params: meta.kdf_params.clone(),
+            verifier_ct: meta.verifier_ct.clone(),
+            verifier_nonce: meta.verifier_nonce.clone(),
+            key_epoch: meta.key_epoch,
+            key_change: Some(meta.key_change.clone()),
+            key_changed_at: None,
         };
+        if let Some(ts) = &meta.key_changed_at {
+            row.key_changed_at = Some(
+                DateTime::parse_from_rfc3339(ts)
+                    .map_err(|e| SyncError::Config(format!("invalid key_changed_at: {e}")))?
+                    .with_timezone(&Utc),
+            );
+        }
         self.post_upsert(session, "vaults", "owner_id", &[row])
             .await
     }

@@ -33,6 +33,10 @@ pub enum CoreError {
     /// or this vault was initialized independently. Nothing was pushed/pulled.
     #[error("the vault master key changed on another device")]
     RemoteKeyChanged,
+    /// The remote `vaults` row carries `verifier_ct` without `verifier_nonce`.
+    /// Refusing to sync beats verifying against a half-written row.
+    #[error("the remote vault verifier is incomplete (ciphertext without nonce)")]
+    RemoteVerifierIncomplete,
     #[error("project already exists")]
     ProjectExists,
     #[error("project not found")]
@@ -184,6 +188,7 @@ impl App {
             &meta.kdf_params,
             &verifier_ct,
             &verifier_nonce,
+            meta.key_epoch + 1,
         )?;
 
         self.last_session_error = session::save_master_key(self.storage.db_path(), &new_key)
@@ -849,6 +854,16 @@ mod tests {
 
         // Drop the temp vault's session so the suite leaves no keyring entry.
         app.lock().unwrap();
+    }
+
+    #[test]
+    fn rekey_increments_key_epoch() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 1);
+        app.unlock(SecretString::new("first".into())).unwrap();
+        app.rekey(SecretString::new("second".into())).unwrap();
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 2);
     }
 
     #[test]
