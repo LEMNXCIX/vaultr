@@ -544,14 +544,14 @@ fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<
 /// Verify a derived key against the remote vault. Prefers the verifier
 /// ciphertext, which works regardless of how many variables exist; falls back
 /// to a sample of variable ciphertexts for vaults predating the verifier
-/// migration.
+/// migration. A wrong password yields `CoreError::InvalidPassword`.
 async fn verify_key_against_remote(
     client: &SyncClient,
     session: &Session,
     key: &MasterKey,
-    vault: Option<&VaultRow>,
+    vault: &VaultRow,
 ) -> Result<(), CoreError> {
-    if let Some((ct, nonce)) = vault.map(verifier_parts).transpose()?.flatten() {
+    if let Some((ct, nonce)) = verifier_parts(vault)? {
         return verify_verifier(key, &ct, &nonce);
     }
     let sample = client
@@ -643,7 +643,7 @@ impl App {
         // No verifier travels over the wire; derive locally and verify
         // against a real remote ciphertext before touching the local vault.
         let key = derive_master_key(&password, &salt, &kdf_params)?;
-        verify_key_against_remote(&client, &session, &key, Some(&vault)).await?;
+        verify_key_against_remote(&client, &session, &key, &vault).await?;
 
         let (verifier_ct, verifier_nonce) =
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
@@ -657,8 +657,9 @@ impl App {
     /// Adopt the remote vault's key after a `RemoteKeyChanged` abort.
     ///
     /// `password` must be the one currently protecting the REMOTE vault: its
-    /// salt + kdf params derive the new key, verified against a remote sample
-    /// ciphertext before anything local is touched. Every local variable is
+    /// salt + kdf params derive the new key, verified against the remote
+    /// verifier ciphertext (or a remote sample ciphertext in vaults predating
+    /// the verifier migration) before anything local is touched. Every local variable is
     /// then re-encrypted under that key (the old in-memory key decrypts the
     /// local rows — the independent-init case included) and `vault_meta` is
     /// replaced by the remote one, so the next sync finds matching salts.
@@ -681,7 +682,7 @@ impl App {
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
         let new_key = derive_master_key(&password, &remote_salt, &kdf_params)?;
-        verify_key_against_remote(&client, &session, &new_key, Some(&vault)).await?;
+        verify_key_against_remote(&client, &session, &new_key, &vault).await?;
 
         let old_key = self.require_key()?;
         let variables = self.storage.all_variables()?;
@@ -724,9 +725,6 @@ impl App {
         let remote_vault = client.get_vault(&session).await?;
         let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
-        // Hoisted for a later epoch task that reads the guard outcome after
-        // this block. The init value covers the uninitialized-vault path.
-        #[allow(unused_assignments)]
         let mut salt_action_taken = SaltAction::Proceed;
         if self.storage.is_initialized()? {
             let meta = self.storage.get_vault_meta()?;
@@ -784,24 +782,28 @@ impl App {
         }
 
         // Backfill: this vault predates the verifier migration. Completing the
-        // verifier makes the next device's password check real. It never touches
-        // salt, kdf_params or key_epoch — only additive fields.
+        // verifier makes the next device's password check real. `push_vault`
+        // upserts a complete `VaultRow` body (`resolution=merge-duplicates`),
+        // so this ALSO rewrites `key_epoch`, `key_change` and `key_changed_at`
+        // — not just the additive verifier fields. That rewrite is safe only
+        // because the guard compared salts first: every epoch bump today also
+        // rotates the salt, so salt-equality currently implies epoch-equality
+        // and the rewritten values equal the remote's. The verifier is
+        // encrypted under the LOCAL key, so the LOCAL `kdf_params` it was
+        // derived from travel with it — never echo the remote params here.
         if needs_verifier_backfill(salt_action_taken, remote_vault.as_ref()) {
             let meta = self.storage.get_vault_meta()?;
             let key = self.require_key()?;
             let (ct, nonce) = encrypt(key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+            let remote = remote_vault
+                .as_ref()
+                .expect("needs_verifier_backfill guarantees a remote vault is present");
             client
                 .push_vault(
                     &session,
                     &VaultMetaPush {
-                        salt: remote_vault
-                            .as_ref()
-                            .map(|v| v.salt.clone())
-                            .unwrap_or_default(),
-                        kdf_params: remote_vault
-                            .as_ref()
-                            .map(|v| v.kdf_params.clone())
-                            .unwrap_or_default(),
+                        salt: remote.salt.clone(),
+                        kdf_params: serde_json::to_value(&meta.kdf_params)?,
                         verifier_ct: Some(b64_encode(&ct)),
                         verifier_nonce: Some(b64_encode(&nonce)),
                         key_epoch: meta.key_epoch,
@@ -810,6 +812,7 @@ impl App {
                     },
                 )
                 .await?;
+            report.pushed += 1;
         }
 
         let projects = self.storage.dirty_projects()?;

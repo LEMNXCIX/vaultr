@@ -183,6 +183,13 @@ impl Storage {
     /// newer edits from other devices. `synced_at` is cleared so each row
     /// re-enters the dirty set (`synced_at IS NULL OR updated_at > synced_at`)
     /// and the new ciphertext propagates on the next push.
+    ///
+    /// Load-bearing for sync: every key-epoch bump today also rotates the
+    /// salt (`rekey` generates a fresh salt; remote-key adoption copies the
+    /// remote one), so salt-equality currently implies epoch-equality. The
+    /// sync verifier-backfill relies on that. A future reset flow that bumps
+    /// the epoch WITHOUT rotating the salt must audit the backfill and the
+    /// salt guard first.
     pub fn apply_key_rotation(
         &self,
         reencrypted: &[(Id, Vec<u8>, Vec<u8>)],
@@ -229,6 +236,11 @@ impl Storage {
 
     /// Overwrite the local key epoch. Used by flows that rotate the master key
     /// without re-encrypting rows (the reset flow in a later plan).
+    ///
+    /// See `apply_key_rotation`: salt-equality implying epoch-equality is
+    /// load-bearing for the sync verifier-backfill. If a reset flow uses this
+    /// to bump the epoch WITHOUT rotating the salt, it breaks that lock and
+    /// must audit the backfill and the salt guard first.
     pub fn set_key_epoch(&self, epoch: i64) -> Result<(), StorageError> {
         let n = self.conn.execute(
             "UPDATE vault_meta SET key_epoch = ?1, updated_at = ?2 WHERE id = 1",
