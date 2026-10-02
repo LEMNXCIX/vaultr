@@ -33,6 +33,10 @@ pub enum CoreError {
     /// or this vault was initialized independently. Nothing was pushed/pulled.
     #[error("the vault master key changed on another device")]
     RemoteKeyChanged,
+    /// The remote `vaults` row carries `verifier_ct` without `verifier_nonce`.
+    /// Refusing to sync beats verifying against a half-written row.
+    #[error("the remote vault verifier is incomplete (ciphertext without nonce)")]
+    RemoteVerifierIncomplete,
     #[error("project already exists")]
     ProjectExists,
     #[error("project not found")]

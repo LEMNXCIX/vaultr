@@ -17,7 +17,7 @@ use storage::{Storage, SyncState, SyncTable};
 
 use crate::{App, CoreError};
 use crypto::{decrypt, derive_master_key, encrypt, MasterKey};
-use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow, VaultMetaPush};
+use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow, VaultMetaPush, VaultRow};
 
 pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
 pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
@@ -471,6 +471,33 @@ fn merge_variable(storage: &Storage, row: &VariableRow) -> Result<MergeOutcome, 
 
 // ---------- App methods ----------
 
+/// Decide how to verify a derived key against the remote vault, given what
+/// the `vaults` row carries. Pure; unit-testable without HTTP.
+///
+/// A complete verifier pair is the strongest signal: it is independent of the
+/// vault's contents, so an empty vault still rejects a wrong password. A row
+/// written before the verifier migration has neither field and falls back to
+/// the sample. A verifier without a nonce is a half-written row and must not
+/// be mistaken for "no verifier".
+#[allow(clippy::type_complexity)]
+fn verifier_parts(vault: &VaultRow) -> Result<Option<(Vec<u8>, Vec<u8>)>, CoreError> {
+    match (&vault.verifier_ct, &vault.verifier_nonce) {
+        (None, None) => Ok(None),
+        (Some(ct), Some(nonce)) => Ok(Some((b64_decode(ct)?, b64_decode(nonce)?))),
+        _ => Err(CoreError::RemoteVerifierIncomplete),
+    }
+}
+
+/// Verify a master key against the remote verifier ciphertext.
+fn verify_verifier(key: &MasterKey, ct: &[u8], nonce: &[u8]) -> Result<(), CoreError> {
+    let plaintext = decrypt(key, ct, nonce).map_err(|_| CoreError::invalid_password())?;
+    if plaintext.as_str() == models::constants::VAULT_VERIFIER_MESSAGE {
+        Ok(())
+    } else {
+        Err(CoreError::invalid_password())
+    }
+}
+
 /// Verify a derived key against a sample of remote variable ciphertexts.
 /// Prefers a live row, falling back to any row (tombstones still carry a
 /// ciphertext). An empty sample — remote exists but has no variables yet —
@@ -493,12 +520,19 @@ fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<
     Ok(())
 }
 
-/// Pull one page of remote variables and verify `key` against a sample.
-async fn verify_password_against_remote(
+/// Verify a derived key against the remote vault. Prefers the verifier
+/// ciphertext, which works regardless of how many variables exist; falls back
+/// to a sample of variable ciphertexts for vaults predating the verifier
+/// migration.
+async fn verify_key_against_remote(
     client: &SyncClient,
     session: &Session,
     key: &MasterKey,
+    vault: Option<&VaultRow>,
 ) -> Result<(), CoreError> {
+    if let Some((ct, nonce)) = vault.map(verifier_parts).transpose()?.flatten() {
+        return verify_verifier(key, &ct, &nonce);
+    }
     let sample = client
         .pull_page::<VariableRow>(session, "variables")
         .await?;
@@ -582,18 +616,19 @@ impl App {
             .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
 
         let salt = b64_decode(&vault.salt)?;
-        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
+        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params.clone())
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
         // No verifier travels over the wire; derive locally and verify
         // against a real remote ciphertext before touching the local vault.
         let key = derive_master_key(&password, &salt, &kdf_params)?;
-        verify_password_against_remote(&client, &session, &key).await?;
+        verify_key_against_remote(&client, &session, &key, Some(&vault)).await?;
 
         let (verifier_ct, verifier_nonce) =
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
             .init_vault(&salt, &kdf_params, &verifier_ct, &verifier_nonce)?;
+        self.storage.set_key_epoch(vault.key_epoch)?;
         self.master_key = Some(key);
         Ok(())
     }
@@ -621,11 +656,11 @@ impl App {
             .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
 
         let remote_salt = b64_decode(&vault.salt)?;
-        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params)
+        let kdf_params: KdfParams = serde_json::from_value(vault.kdf_params.clone())
             .map_err(|e| CoreError::Other(format!("invalid kdf params on server: {e}")))?;
 
         let new_key = derive_master_key(&password, &remote_salt, &kdf_params)?;
-        verify_password_against_remote(&client, &session, &new_key).await?;
+        verify_key_against_remote(&client, &session, &new_key, Some(&vault)).await?;
 
         let old_key = self.require_key()?;
         let variables = self.storage.all_variables()?;
@@ -1253,6 +1288,72 @@ mod tests {
         let mut tombstone = row;
         tombstone.deleted = true;
         assert!(verify_key_against_sample(&good_key, &[tombstone]).is_ok());
+    }
+
+    fn vault_row_with_verifier(key: &MasterKey) -> VaultRow {
+        let (ct, nonce) = encrypt(key, models::constants::VAULT_VERIFIER_MESSAGE).unwrap();
+        VaultRow {
+            owner_id: None,
+            salt: "c2FsdA==".into(),
+            kdf_params: serde_json::json!({"m_cost": 2048, "t_cost": 1, "p_cost": 1, "output_len": 32}),
+            verifier_ct: Some(b64_encode(&ct)),
+            verifier_nonce: Some(b64_encode(&nonce)),
+            key_epoch: 1,
+            key_change: Some("init".into()),
+            key_changed_at: None,
+        }
+    }
+
+    fn test_keys() -> (MasterKey, MasterKey, KdfParams, Vec<u8>) {
+        let params = KdfParams {
+            m_cost: 2048,
+            t_cost: 1,
+            p_cost: 1,
+            output_len: 32,
+        };
+        let salt = vec![9u8; 16];
+        let good =
+            derive_master_key(&SecretString::new("correct-horse".into()), &salt, &params).unwrap();
+        let bad = derive_master_key(&SecretString::new("wrong".into()), &salt, &params).unwrap();
+        (good, bad, params, salt)
+    }
+
+    #[test]
+    fn verifier_accepts_only_the_right_key() {
+        let (good, bad, _, _) = test_keys();
+        let row = vault_row_with_verifier(&good);
+        let (ct, nonce) = (
+            b64_decode(row.verifier_ct.as_ref().unwrap()).unwrap(),
+            b64_decode(row.verifier_nonce.as_ref().unwrap()).unwrap(),
+        );
+        assert!(verify_verifier(&good, &ct, &nonce).is_ok());
+        assert!(matches!(
+            verify_verifier(&bad, &ct, &nonce),
+            Err(CoreError::InvalidPassword(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_ciphertext_of_the_wrong_constant() {
+        // Right key, but the row was encrypted over some other plaintext: the
+        // AEAD tag passes yet the message must not match.
+        let (good, _, _, _) = test_keys();
+        let (ct, nonce) = encrypt(&good, "some-other-value").unwrap();
+        assert!(matches!(
+            verify_verifier(&good, &ct, &nonce),
+            Err(CoreError::InvalidPassword(_))
+        ));
+    }
+
+    #[test]
+    fn verifier_row_without_nonce_is_an_explicit_error() {
+        let (good, _, _, _) = test_keys();
+        let mut row = vault_row_with_verifier(&good);
+        row.verifier_nonce = None;
+        assert!(matches!(
+            verifier_parts(&row),
+            Err(CoreError::RemoteVerifierIncomplete)
+        ));
     }
 
     #[test]
