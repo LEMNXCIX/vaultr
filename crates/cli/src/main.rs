@@ -517,13 +517,14 @@ fn main() -> Result<()> {
             if !app.is_initialized()? {
                 bail!("Vault not initialized. Nothing to reset.");
             }
-            // `--local` skips the remote wipe *now*, not this check: the epoch a
-            // reset installs is the epoch that wipe pushes to the server.
+            // `--local` skips the remote wipe, so it is also the way out when
+            // there is no sync session: the epoch the wipe publishes is
+            // computed in core, where the remote row is in hand.
             if !local && !(App::sync_available_config() && App::sync_session_exists()) {
                 bail!(
-                    "Reset necesita una sesión de Supabase para leer el key_epoch remoto: ejecuta \
-                     `vltr login` y repite. `--local` tampoco sirve aquí: difiere el borrado \
-                     remoto, no la lectura del epoch."
+                    "Reset sin sincronización no puede borrar el vault remoto: ejecuta `vltr login` \
+                     y repite, o usa `--local` para resetear solo este dispositivo (el borrado \
+                     remoto queda para el próximo `vltr sync`)."
                 );
             }
             // Everything from here to the confirmation is read-only: no write, no
@@ -551,23 +552,12 @@ fn main() -> Result<()> {
             if !crypto::passwords_match(&new, &confirm) {
                 bail!("Passwords do not match");
             }
-            let has_remote = if !App::sync_available_config() {
-                bail!(
-                    "Reset necesita Supabase para leer el key_epoch remoto: sync no configurado \
-                     (ver docs/SYNC.md). `--local` no lo evita — el epoch es precisamente lo \
-                     que el borrado remoto sube al servidor."
-                );
-            } else {
-                match block_on(App::remote_has_vault()) {
-                    Ok(has) => has,
-                    Err(e) => bail!("Sin conexión con Supabase: {e}"),
-                }
-            };
-            let target_epoch = reset_target_epoch(has_remote)?;
-            app.reset_local(new, target_epoch)?;
+            // No epoch argument: core derives the local placeholder from this vault
+            // and publishes `remote + 1` from the row it fetches.
+            let epoch = app.reset_local(new)?;
             println!(
                 "Vault local destruido y reiniciado con nueva contraseña maestra (key_epoch \
-                 {target_epoch})."
+                 {epoch})."
             );
             print_session_status(&mut app);
             if local {
@@ -729,33 +719,6 @@ fn prompt_line_verbatim(prompt: &str) -> Result<String> {
 /// footgun pointed at the user's data.
 fn confirmation_matches(input: &str) -> bool {
     input == "RESET IT"
-}
-
-/// The `key_epoch` a reset must install locally: `remote.key_epoch + 1`, or `1`
-/// when the account has no `vaults` row.
-///
-/// The value is load-bearing in a way that is easy to miss. The remote half of
-/// the reset pushes the LOCAL epoch to the server, and another device only
-/// learns that a reset happened when the remote epoch is *ahead* of its own
-/// (`salt_action` → `RemoteReset`). An epoch that is too low is not cosmetic:
-/// the other device is merely told the master password changed, asked for it,
-/// and on answering it re-encrypts and re-pushes its pre-wipe rows — resurrecting
-/// exactly what this command exists to destroy.
-///
-/// `core` exposes `App::remote_has_vault()` (a bool) but no accessor for
-/// `vaults.key_epoch`, so the online case cannot be computed from the CLI. Until
-/// it can, refuse rather than install an epoch that is known to be wrong.
-fn reset_target_epoch(has_remote_vault: bool) -> Result<i64> {
-    if has_remote_vault {
-        bail!(
-            "vltr reset no puede calcular el key_epoch remoto: `core` expone \
-             `remote_has_vault()` pero no `vaults.key_epoch`. Un epoch estimado bajaría \
-             el key_epoch del servidor, y el otro dispositivo no reconocería el reset: \
-             adoptaría la contraseña nueva y volvería a subir sus filas anteriores al \
-             borrado. Falta `App::remote_key_epoch()` en core para hacerlo bien."
-        );
-    }
-    Ok(1)
 }
 
 fn resolve_project(app: &App, flag: Option<String>) -> Result<String> {

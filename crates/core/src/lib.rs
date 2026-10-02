@@ -209,18 +209,25 @@ impl App {
     /// `require_key()`: the lost password is the reason this exists. The old
     /// rows are deleted rather than re-encrypted because their key is gone.
     ///
+    /// The epoch installed here is a LOCAL placeholder, advanced from this
+    /// vault's own epoch. It is not the epoch the server ends up with: the
+    /// authoritative value is `remote + 1`, computed by
+    /// [`App::reset_remote`] / `sync()` where the remote row is in hand. That is
+    /// why this takes no epoch argument — an offline caller cannot know the
+    /// remote counter, and a guessed value could only ever lower it.
+    ///
     /// Records `pending_local_reset` so a later sync pushes the matching
     /// remote wipe, and clears any `pending_rekey_salt` — a reset subsumes
     /// both markers, and only one may be active at a time.
-    pub fn reset_local(
-        &mut self,
-        new_password: SecretString,
-        target_epoch: i64,
-    ) -> Result<(), CoreError> {
+    ///
+    /// Returns the local epoch installed.
+    pub fn reset_local(&mut self, new_password: SecretString) -> Result<i64, CoreError> {
         if !self.storage.is_initialized()? {
             return Err(CoreError::Other("vault not initialized".into()));
         }
-        let kdf_params = self.storage.get_vault_meta()?.kdf_params;
+        let meta = self.storage.get_vault_meta()?;
+        let kdf_params = meta.kdf_params;
+        let target_epoch = meta.key_epoch + 1;
         let salt = generate_salt();
         let new_key = derive_master_key(&new_password, &salt, &kdf_params)?;
         let (verifier_ct, verifier_nonce) =
@@ -242,7 +249,7 @@ impl App {
             .err()
             .map(|e| e.to_string());
         self.master_key = Some(new_key);
-        Ok(())
+        Ok(target_epoch)
     }
 
     /// True when a local reset still needs its remote wipe pushed.
@@ -922,7 +929,8 @@ mod tests {
         // Note: locked, and no call supplying the old password anywhere.
         // `reset_local` must work without an unlocked vault.
         app.lock().unwrap();
-        app.reset_local(SecretString::new("brand-new".into()), 7)
+        let epoch = app
+            .reset_local(SecretString::new("brand-new".into()))
             .unwrap();
 
         assert!(app.storage.list_projects().unwrap().is_empty());
@@ -932,7 +940,11 @@ mod tests {
             meta.salt, old_salt,
             "a reset must rotate the salt, never keep it"
         );
-        assert_eq!(meta.key_epoch, 7);
+        assert_eq!(epoch, 2, "advances from the vault's own epoch of 1");
+        assert_eq!(
+            meta.key_epoch, epoch,
+            "the returned epoch is the one stored"
+        );
         assert!(!meta.verifier_ct.is_empty());
 
         // The new password opens it; the old one does not.
@@ -958,12 +970,28 @@ mod tests {
         );
 
         app.lock().unwrap();
-        app.reset_local(SecretString::new("third".into()), 9)
-            .unwrap();
+        app.reset_local(SecretString::new("third".into())).unwrap();
         assert_eq!(
             SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn reset_local_advances_the_epoch_from_its_own_value() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        app.rekey(SecretString::new("second".into())).unwrap();
+        app.rekey(SecretString::new("third".into())).unwrap();
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 3);
+
+        // No epoch argument: the caller cannot install an arbitrary value, so
+        // the reset can never write a counter the local vault does not own.
+        assert_eq!(
+            app.reset_local(SecretString::new("fourth".into())).unwrap(),
+            4
+        );
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 4);
     }
 
     #[test]
