@@ -86,6 +86,12 @@ impl App {
         Ok(self.storage.is_initialized()?)
     }
 
+    /// Path of the vault file, or `None` for in-memory storage. Sessions are
+    /// scoped to it: one persisted session per database.
+    pub fn db_path(&self) -> Option<&std::path::Path> {
+        self.storage.db_path()
+    }
+
     pub fn init(&mut self, password: SecretString) -> Result<(), CoreError> {
         if self.storage.is_initialized()? {
             return Err(CoreError::Other("vault already initialized".into()));
@@ -97,7 +103,9 @@ impl App {
             encrypt(&key, models::constants::VAULT_VERIFIER_MESSAGE)?;
         self.storage
             .init_vault(&salt, &params, &verifier_ct, &verifier_nonce)?;
-        self.last_session_error = session::save_master_key(&key).err().map(|e| e.to_string());
+        self.last_session_error = session::save_master_key(self.storage.db_path(), &key)
+            .err()
+            .map(|e| e.to_string());
         self.master_key = Some(key);
         Ok(())
     }
@@ -111,7 +119,9 @@ impl App {
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
             return Err(CoreError::invalid_password());
         }
-        self.last_session_error = session::save_master_key(&key).err().map(|e| e.to_string());
+        self.last_session_error = session::save_master_key(self.storage.db_path(), &key)
+            .err()
+            .map(|e| e.to_string());
         self.master_key = Some(key);
         Ok(())
     }
@@ -176,7 +186,7 @@ impl App {
             &verifier_nonce,
         )?;
 
-        self.last_session_error = session::save_master_key(&new_key)
+        self.last_session_error = session::save_master_key(self.storage.db_path(), &new_key)
             .err()
             .map(|e| e.to_string());
         self.master_key = Some(new_key);
@@ -192,7 +202,7 @@ impl App {
         let marker = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
             .map_err(|_| CoreError::invalid_password())?;
         if marker.as_str() != models::constants::VAULT_VERIFIER_MESSAGE {
-            let _ = session::clear_session();
+            let _ = session::clear_session(self.storage.db_path());
             return Err(CoreError::invalid_password());
         }
         self.master_key = Some(key);
@@ -205,7 +215,7 @@ impl App {
         if self.is_unlocked() {
             return Ok(true);
         }
-        match session::load_master_key()? {
+        match session::load_master_key(self.storage.db_path())? {
             Some(key) => {
                 self.unlock_with_key(key)?;
                 Ok(true)
@@ -214,21 +224,22 @@ impl App {
         }
     }
 
-    /// Clear the in-process key and any persisted session (keyring + local session file).
+    /// Clear the in-process key and this vault's persisted session (keyring +
+    /// local session file). Other vaults are untouched.
     pub fn lock(&mut self) -> Result<(), CoreError> {
         self.master_key = None;
         self.last_session_error = None;
-        session::clear_session()?;
+        session::clear_session(self.storage.db_path())?;
         Ok(())
     }
 
-    pub fn has_keyring_session() -> Result<bool, CoreError> {
-        Ok(session::inspect()?.is_some())
+    pub fn has_keyring_session(&self) -> Result<bool, CoreError> {
+        Ok(session::inspect(self.storage.db_path())?.is_some())
     }
 
     /// Where the current session is stored, if any (does not refresh the TTL).
-    pub fn session_store() -> Result<Option<session::SessionStore>, CoreError> {
-        Ok(session::inspect()?.map(|info| info.store))
+    pub fn session_store(&self) -> Result<Option<session::SessionStore>, CoreError> {
+        Ok(session::inspect(self.storage.db_path())?.map(|info| info.store))
     }
 
     pub fn is_unlocked(&self) -> bool {

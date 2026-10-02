@@ -20,6 +20,9 @@ pub const LEGACY_APP_NAME: &str = "secrets-manager";
 
 /// OS keyring service / account identifiers.
 pub const KEYRING_SERVICE: &str = "dev.secrets-manager.vault";
+/// Prefix of the master-key session account. The final account is
+/// `<prefix>-<hash of the database path>` (see `core::session::keyring_account`),
+/// so one session per vault.
 pub const KEYRING_ACCOUNT: &str = "master-key-session";
 
 /// Sliding session TTL (seconds).

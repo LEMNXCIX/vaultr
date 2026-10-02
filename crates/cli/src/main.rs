@@ -199,8 +199,8 @@ fn main() -> Result<()> {
             // Remote guard: initializing here when this account already has a
             // vault on the server would create a divergent key domain. Never
             // block init on network trouble — local-first above all.
-            if App::sync_available_config() && App::sync_session_exists() {
-                match block_on(App::remote_has_vault()) {
+            if App::sync_available_config() && app.sync_session_exists() {
+                match block_on(app.remote_has_vault()) {
                     Ok(true) => bail!(
                         "A vault already exists on the server for this account. Run `vltr bootstrap` to join it with the same master password."
                     ),
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
             }
             let password = prompt_password("Master password: ")?;
             app.unlock(password)?;
-            match App::session_store()? {
+            match app.session_store()? {
                 Some(vltr_core::session::SessionStore::Keyring) => {
                     println!("Vault unlocked (session saved in OS keyring).");
                 }
@@ -256,7 +256,7 @@ fn main() -> Result<()> {
             }
             let mut app = App::open(&db_path)?;
             let initialized = app.is_initialized()?;
-            let info = vltr_core::session::inspect().ok().flatten();
+            let info = vltr_core::session::inspect(app.db_path()).ok().flatten();
             if info.is_some() {
                 let _ = app.try_unlock_from_session();
             }
@@ -551,7 +551,7 @@ fn main() -> Result<()> {
             require_sync_config()?;
             let app = App::open(&db_path)?;
             if !app.is_initialized()? {
-                match block_on(App::remote_has_vault()) {
+                match block_on(app.remote_has_vault()) {
                     Ok(true) => bail!(
                         "este dispositivo no tiene vault pero el remoto sí; usa `vltr bootstrap`"
                     ),
@@ -783,7 +783,7 @@ fn open_and_verify(db_path: &std::path::Path) -> Result<App> {
 }
 
 fn print_session_status(app: &mut App) {
-    match App::session_store().ok().flatten() {
+    match app.session_store().ok().flatten() {
         Some(vltr_core::session::SessionStore::Keyring) => {}
         Some(vltr_core::session::SessionStore::Memory) => {
             eprintln!("OS keyring is unavailable; using a local session file instead.");
@@ -795,7 +795,7 @@ fn print_session_status(app: &mut App) {
 fn warn_if_session_unavailable(app: &mut App) {
     if let Some(reason) = app.take_session_error() {
         eprintln!("Warning: no session store could be saved ({reason}); the password will be requested for future commands.");
-    } else if !App::has_keyring_session().unwrap_or(false) {
+    } else if !app.has_keyring_session().unwrap_or(false) {
         eprintln!(
             "Warning: no session store is available; the password will be requested for future commands."
         );

@@ -76,16 +76,23 @@ impl SyncState {
 
 pub struct Storage {
     conn: Connection,
+    /// Vault file this connection is bound to. `None` for in-memory storage:
+    /// there is no file, so nothing can be keyed on it.
+    path: Option<PathBuf>,
 }
 
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        if let Some(parent) = path.as_ref().parent() {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(&path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        let storage = Self { conn };
+        let storage = Self {
+            conn,
+            path: Some(path),
+        };
         storage.migrate()?;
         Ok(storage)
     }
@@ -93,9 +100,15 @@ impl Storage {
     pub fn open_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let storage = Self { conn };
+        let storage = Self { conn, path: None };
         storage.migrate()?;
         Ok(storage)
+    }
+
+    /// Path of the vault file, or `None` for in-memory storage. Callers use it
+    /// to scope persisted sessions to one database.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -849,6 +862,18 @@ mod tests {
         s.create_project(&p).unwrap();
         let found = s.get_project_by_name("Fudi").unwrap().unwrap();
         assert_eq!(found.name, "Fudi");
+    }
+
+    #[test]
+    fn db_path_is_set_for_file_vaults_and_none_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+
+        let file_backed = Storage::open(&path).unwrap();
+        assert_eq!(file_backed.db_path(), Some(path.as_path()));
+
+        // In-memory storage has no file, therefore nothing to key a session on.
+        assert_eq!(Storage::open_in_memory().unwrap().db_path(), None);
     }
 
     #[test]
