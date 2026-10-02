@@ -21,9 +21,20 @@ use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow};
 
 pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
 pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
-/// Prefix of the keyring account holding the Supabase JWT session (service =
-/// KEYRING_SERVICE); the per-database suffix is appended by
-/// [`crate::session::keyring_account`].
+/// Keyring account holding the Supabase JWT session (service =
+/// KEYRING_SERVICE).
+///
+/// **Deliberately global, unlike the master-key session: this is an ACCOUNT
+/// credential, not a vault credential.** One person has one Supabase account
+/// and one login, so every vault shares it — it is the same account talking to
+/// the same server. `vltr logout` logging the account out entirely is the
+/// correct semantic; there is no such thing as logging out of one vault.
+///
+/// Do NOT scope it per database (the master key IS scoped per database, see
+/// `core::session::session_account`). A database being created has no
+/// session of its own, so [`init_remote_guard_needed`] would be false on every
+/// `vltr init`: the guard would never ask the server whether this account
+/// already has a vault, silently creating a divergent local key domain.
 const KEYRING_ACCOUNT_SUPABASE: &str = "supabase-session";
 /// `sync_state` cursor key for incremental pull.
 const CURSOR_KEY: &str = "last_pull";
@@ -91,42 +102,34 @@ impl fmt::Debug for StoredSession {
     }
 }
 
-/// Keyring entry for this vault's Supabase session. `None` (in-memory storage)
-/// means there is nothing to persist.
-fn supabase_entry(db_path: Option<&std::path::Path>) -> Result<Option<Entry>, CoreError> {
-    let Some(account) = crate::session::keyring_account(KEYRING_ACCOUNT_SUPABASE, db_path) else {
-        return Ok(None);
-    };
-    let entry = Entry::new(models::constants::KEYRING_SERVICE, &account).map_err(|e| {
+/// Keyring entry for the account's Supabase session. Account-global on purpose
+/// (see [`KEYRING_ACCOUNT_SUPABASE`]), so it takes no database.
+fn supabase_entry() -> Result<Entry, CoreError> {
+    Entry::new(models::constants::KEYRING_SERVICE, KEYRING_ACCOUNT_SUPABASE).map_err(|e| {
         CoreError::Other(format!(
             "OS keyring unavailable ({e}); sync requires it to store the Supabase session"
         ))
-    })?;
-    Ok(Some(entry))
+    })
 }
 
-/// Fallback file for one vault's Supabase session; the per-database account
-/// keeps `logout` on one vault from clearing another's session.
-fn supabase_session_file(db_path: &std::path::Path) -> Result<std::path::PathBuf, CoreError> {
+/// Fallback file for the account's Supabase session. Fixed name, same reason as
+/// the keyring account: one login for the account, shared by every vault.
+fn supabase_session_file() -> Result<std::path::PathBuf, CoreError> {
     let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")
         .map(|d| d.data_dir().to_path_buf())
         .ok_or_else(|| CoreError::Other("cannot determine Vaultr data directory".into()))?;
     std::fs::create_dir_all(&dir)?;
-    let account = format!(
-        "{KEYRING_ACCOUNT_SUPABASE}-{}",
-        crate::session::session_account(db_path)
-    );
-    Ok(dir.join(format!("{account}.json")))
+    Ok(dir.join("sync-session.json"))
 }
 
-fn save_supabase_file(db_path: &std::path::Path, stored: &StoredSession) -> Result<(), CoreError> {
-    let path = supabase_session_file(db_path)?;
+fn save_supabase_file(stored: &StoredSession) -> Result<(), CoreError> {
+    let path = supabase_session_file()?;
     let json = serde_json::to_string(stored).map_err(|e| CoreError::Other(e.to_string()))?;
     crate::session::write_0600(&path, &json)
 }
 
-fn load_supabase_file(db_path: &std::path::Path) -> Result<Option<StoredSession>, CoreError> {
-    let path = supabase_session_file(db_path)?;
+fn load_supabase_file() -> Result<Option<StoredSession>, CoreError> {
+    let path = supabase_session_file()?;
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -144,14 +147,8 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Persist `session` for `db_path`. `None` persists nothing (in-memory).
-fn save_supabase_session(
-    db_path: Option<&std::path::Path>,
-    session: &Session,
-) -> Result<(), CoreError> {
-    let Some(db_path) = db_path else {
-        return Ok(());
-    };
+/// Persist the account's `session`.
+fn save_supabase_session(session: &Session) -> Result<(), CoreError> {
     let stored = StoredSession {
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
@@ -162,7 +159,7 @@ fn save_supabase_session(
     // Keyring primero (con verificación de lectura); archivo 0600 como
     // fallback (mismo patrón que la master key).
     let json = serde_json::to_string(&stored).map_err(|e| CoreError::Other(e.to_string()))?;
-    if let Some(entry) = supabase_entry(Some(db_path))? {
+    if let Ok(entry) = supabase_entry() {
         if entry.set_password(&json).is_ok()
             && entry.get_password().map(|r| r == json).unwrap_or(false)
         {
@@ -170,17 +167,12 @@ fn save_supabase_session(
         }
         let _ = entry.delete_credential();
     }
-    save_supabase_file(db_path, &stored)
+    save_supabase_file(&stored)
 }
 
-/// Load the Supabase session stored for `db_path`. `None` reads nothing.
-fn load_stored_session(
-    db_path: Option<&std::path::Path>,
-) -> Result<Option<StoredSession>, CoreError> {
-    let Some(db_path) = db_path else {
-        return Ok(None);
-    };
-    if let Some(entry) = supabase_entry(Some(db_path))? {
+/// Load the account's stored Supabase session.
+fn load_stored_session() -> Result<Option<StoredSession>, CoreError> {
+    if let Ok(entry) = supabase_entry() {
         match entry.get_password() {
             Ok(raw) => {
                 let stored: StoredSession = serde_json::from_str(&raw).map_err(|_| {
@@ -194,18 +186,29 @@ fn load_stored_session(
             Err(e) => return Err(CoreError::Other(format!("keyring: {e}"))),
         }
     }
-    load_supabase_file(db_path)
+    load_supabase_file()
 }
 
-/// Clear only `db_path`'s Supabase session. `None` clears nothing.
-fn clear_supabase_session(db_path: Option<&std::path::Path>) -> Result<(), CoreError> {
-    let Some(entry) = supabase_entry(db_path)? else {
-        return Ok(());
-    };
+/// Log the account out of sync everywhere. Not per-vault on purpose
+/// ([`KEYRING_ACCOUNT_SUPABASE`]).
+fn clear_supabase_session() -> Result<(), CoreError> {
+    let entry = supabase_entry()?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(_) => Ok(()), // ponytail: best-effort clear; a stuck backend must not block logout
     }
+}
+
+/// Whether `vltr init` must ask the server whether this account already has a
+/// vault before creating a local one — otherwise init creates a second key
+/// domain the account can never merge back.
+///
+/// Both inputs are ACCOUNT-level (sync configured, account session) and must
+/// never become per-database: the database being initialized has no session of
+/// its own, so a per-database probe would make this `false` on every `init`
+/// and silently drop the guard.
+pub fn init_remote_guard_needed(sync_configured: bool, account_session: bool) -> bool {
+    sync_configured && account_session
 }
 
 /// Supabase credentials: env vars first, then `<data_dir>/sync.json`
@@ -241,12 +244,9 @@ fn sync_client() -> Result<SyncClient, CoreError> {
     SyncClient::new(&url, &key).map_err(CoreError::from)
 }
 
-/// Stored session for `db_path`, with refresh if the access token expired.
-async fn fresh_session(
-    db_path: Option<&std::path::Path>,
-    client: &SyncClient,
-) -> Result<Session, CoreError> {
-    let stored = load_stored_session(db_path)?
+/// The account's stored session, with refresh if the access token expired.
+async fn fresh_session(client: &SyncClient) -> Result<Session, CoreError> {
+    let stored = load_stored_session()?
         .ok_or_else(|| CoreError::Other("not logged in to sync; run 'vltr login' first".into()))?;
     if stored.saved_at.saturating_add(stored.expires_in) > now_unix() + REFRESH_MARGIN_SECS {
         return Ok(Session {
@@ -261,7 +261,7 @@ async fn fresh_session(
             "session refresh failed ({e}); run 'vltr login' again"
         ))
     })?;
-    save_supabase_session(db_path, &refreshed)?;
+    save_supabase_session(&refreshed)?;
     Ok(refreshed)
 }
 
@@ -544,21 +544,23 @@ impl App {
         read_sync_config().is_some()
     }
 
-    /// True when a vault exists on the server (requires this vault's stored session).
-    pub async fn remote_has_vault(&self) -> Result<bool, CoreError> {
+    /// True when a vault exists on the server (requires the account's stored
+    /// session — account-global, see [`KEYRING_ACCOUNT_SUPABASE`]).
+    pub async fn remote_has_vault() -> Result<bool, CoreError> {
         let client = sync_client()?;
-        let session = fresh_session(self.storage.db_path(), &client).await?;
+        let session = fresh_session(&client).await?;
         Ok(client.get_vault(&session).await?.is_some())
     }
 
-    /// Log in to Supabase and persist the JWT session for this vault in the OS keyring.
+    /// Log in to Supabase and persist the JWT session in the OS keyring. One
+    /// login per account, shared by every vault.
     pub async fn sync_login(&self, email: &str, password: &str) -> Result<(), CoreError> {
         let client = sync_client()?;
         let session = client
             .login(email, password)
             .await
             .map_err(|e| CoreError::Other(format!("supabase login failed: {e}")))?;
-        save_supabase_session(self.storage.db_path(), &session)
+        save_supabase_session(&session)
     }
 
     /// Create a Supabase account. Returns `true` when the response carried a
@@ -572,31 +574,35 @@ impl App {
             .map_err(|e| CoreError::Other(format!("supabase signup failed: {e}")))?;
         match session {
             Some(session) => {
-                save_supabase_session(self.storage.db_path(), &session)?;
+                save_supabase_session(&session)?;
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
-    /// Remove this vault's stored Supabase session; other vaults keep theirs.
+    /// Log the account out of sync. Not per-vault on purpose
+    /// ([`KEYRING_ACCOUNT_SUPABASE`]).
     pub fn sync_logout(&self) -> Result<(), CoreError> {
-        clear_supabase_session(self.storage.db_path())
+        clear_supabase_session()
     }
 
-    /// True when sync env vars are set and this vault has a Supabase session.
-    pub fn sync_enabled(&self) -> bool {
+    /// True when sync env vars are set and the account has a Supabase session.
+    pub fn sync_enabled() -> bool {
         std::env::var(SUPABASE_URL_ENV).is_ok_and(|v| !v.is_empty())
             && std::env::var(SUPABASE_KEY_ENV).is_ok_and(|v| !v.is_empty())
-            && matches!(load_stored_session(self.storage.db_path()), Ok(Some(_)))
+            && matches!(load_stored_session(), Ok(Some(_)))
     }
 
-    /// True when this vault has a Supabase session stored (keyring or fallback
+    /// True when the account has a Supabase session stored (keyring or fallback
     /// file), regardless of how sync is configured. Unlike
     /// [`App::sync_enabled`], this checks the session alone — env vars /
     /// sync.json are irrelevant.
-    pub fn sync_session_exists(&self) -> bool {
-        matches!(load_stored_session(self.storage.db_path()), Ok(Some(_)))
+    ///
+    /// Takes no database on purpose: `vltr init` consults this before the vault
+    /// exists. See [`init_remote_guard_needed`].
+    pub fn sync_session_exists() -> bool {
+        matches!(load_stored_session(), Ok(Some(_)))
     }
 
     /// New device: take the vault metadata from the server, initialize the
@@ -609,7 +615,7 @@ impl App {
             ));
         }
         let client = sync_client()?;
-        let session = fresh_session(self.storage.db_path(), &client).await?;
+        let session = fresh_session(&client).await?;
         let vault = client
             .get_vault(&session)
             .await?
@@ -648,7 +654,7 @@ impl App {
             return Err(CoreError::Other("vault not initialized".into()));
         }
         let client = sync_client()?;
-        let session = fresh_session(self.storage.db_path(), &client).await?;
+        let session = fresh_session(&client).await?;
         let vault = client
             .get_vault(&session)
             .await?
@@ -691,7 +697,7 @@ impl App {
     /// LWW merge → cascade → persist cursor. Moves ciphertext only.
     pub async fn sync(&self) -> Result<SyncReport, CoreError> {
         let client = sync_client()?;
-        let session = fresh_session(self.storage.db_path(), &client).await?;
+        let session = fresh_session(&client).await?;
         let mut report = SyncReport::default();
 
         // ---- Salt guard: decide BEFORE anything is pushed or pulled. ----
@@ -1280,20 +1286,25 @@ mod tests {
     }
 
     #[test]
-    fn supabase_session_account_is_per_database_and_never_shares_the_master_key_slot() {
-        let vault = std::path::Path::new("/srv/one/vault.db");
-        let other = std::path::Path::new("/srv/two/vault.db");
+    fn init_remote_guard_does_not_consult_the_vault_being_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = App::open(dir.path().join("vault.db")).unwrap();
 
-        let supa = crate::session::keyring_account(KEYRING_ACCOUNT_SUPABASE, Some(vault));
-        let supa_other = crate::session::keyring_account(KEYRING_ACCOUNT_SUPABASE, Some(other));
-        assert_ne!(supa, supa_other, "each vault needs its own sync session");
+        // A database that was just created has no master-key session of its own…
+        assert!(fresh.session_store().unwrap().is_none());
 
-        // The Supabase slot must not collide with the master-key slot of the
-        // same vault: both are stored under the same keyring service.
-        let master_key =
-            crate::session::keyring_account(models::constants::KEYRING_ACCOUNT, Some(vault));
-        assert_ne!(supa, master_key);
-        assert_ne!(supa, None);
+        // …yet the guard `vltr init` runs is armed by ACCOUNT-level state only,
+        // so it still fires. That is the situation on every `init`.
+        assert!(init_remote_guard_needed(true, true));
+        assert!(!init_remote_guard_needed(false, true));
+        assert!(!init_remote_guard_needed(true, false));
+
+        // Compile-time pin on the probes: they keep taking no database. Making
+        // the Supabase session per-vault again breaks this test at compile
+        // time, because a new database has no session and the guard would
+        // silently skip `remote_has_vault()`.
+        let _configured: fn() -> bool = App::sync_available_config;
+        let _session: fn() -> bool = App::sync_session_exists;
     }
 
     #[test]

@@ -796,6 +796,11 @@ mod tests {
             .unwrap();
         let v = app2.get_variable("Fudi", "local", "KEY").unwrap();
         assert_eq!(v.value, "secret-value");
+
+        // Both temp vaults opened a real session; drop them so the test suite
+        // leaves no keyring entry behind.
+        app2.lock().unwrap();
+        app.lock().unwrap();
     }
 
     #[test]
@@ -841,6 +846,9 @@ mod tests {
         // The sync guard marker is pinned to the new local salt.
         let marker = SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap();
         assert_eq!(marker.as_deref(), Some(hex::encode(after.salt).as_str()));
+
+        // Drop the temp vault's session so the suite leaves no keyring entry.
+        app.lock().unwrap();
     }
 
     #[test]

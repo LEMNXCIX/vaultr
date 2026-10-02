@@ -199,8 +199,11 @@ fn main() -> Result<()> {
             // Remote guard: initializing here when this account already has a
             // vault on the server would create a divergent key domain. Never
             // block init on network trouble — local-first above all.
-            if App::sync_available_config() && app.sync_session_exists() {
-                match block_on(app.remote_has_vault()) {
+            if vltr_core::sync::init_remote_guard_needed(
+                App::sync_available_config(),
+                App::sync_session_exists(),
+            ) {
+                match block_on(App::remote_has_vault()) {
                     Ok(true) => bail!(
                         "A vault already exists on the server for this account. Run `vltr bootstrap` to join it with the same master password."
                     ),
@@ -551,7 +554,7 @@ fn main() -> Result<()> {
             require_sync_config()?;
             let app = App::open(&db_path)?;
             if !app.is_initialized()? {
-                match block_on(app.remote_has_vault()) {
+                match block_on(App::remote_has_vault()) {
                     Ok(true) => bail!(
                         "este dispositivo no tiene vault pero el remoto sí; usa `vltr bootstrap`"
                     ),

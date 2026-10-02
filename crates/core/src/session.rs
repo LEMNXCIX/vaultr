@@ -80,7 +80,7 @@ fn canonical_db_path(path: &Path) -> PathBuf {
 /// overwrites the real one. SHA-256 of the canonical path, truncated — enough
 /// to separate local vaults, and it keeps the path out of the keyring
 /// metadata, which any process holding the key can read.
-pub(crate) fn session_account(db_path: &Path) -> String {
+fn session_account(db_path: &Path) -> String {
     let canonical = canonical_db_path(db_path);
     // Exact bytes on unix; lossy elsewhere (Windows paths are rarely
     // non-UTF-8, and `as_encoded_bytes` would not be stable across releases).
@@ -94,12 +94,6 @@ pub(crate) fn session_account(db_path: &Path) -> String {
 
     let digest = hex::encode(Sha256::digest(&bytes));
     digest[..ACCOUNT_HEX_LEN].to_string()
-}
-
-/// Keyring account for one session slot of one database. `None` means the
-/// database is in-memory: no slot, therefore nothing to persist.
-pub(crate) fn keyring_account(prefix: &str, db_path: Option<&Path>) -> Option<String> {
-    db_path.map(|path| format!("{prefix}-{}", session_account(path)))
 }
 
 fn entry(db_path: &Path) -> Result<Entry, CoreError> {
