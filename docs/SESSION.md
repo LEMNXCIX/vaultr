@@ -69,8 +69,10 @@ Un vault en memoria (tests) no persiste sesión: no hay archivo al cual asociarl
 | Ámbito | **Cuenta** (compartida por todos los vaults), no vault |
 | Service (keyring) | `dev.secrets-manager.vault` |
 | Account (keyring) | `supabase-session` (fijo, sin hash) |
-| Ruta (fallback) | `~/.local/share/vaultr/sync-session.json` |
+| Ruta (fallback) | `~/.local/share/vaultr/sync-session.json` (override: `VLTR_SYNC_SESSION_FILE`) |
 | Se limpia con | `vltr logout` (la cuenta entera) |
+
+`VLTR_SYNC_SESSION_FILE` (path no vacío) manda la sesión de Supabase **solo** a ese archivo y **desactiva el keyring a propósito**: si no, el test suite pisaría el login real del developer, y las máquinas sin keyring usable no tendrían dónde caerse. Existe para tests y para máquinas sin keyring; en uso normal no se setea.
 
 ## Seguridad
 
