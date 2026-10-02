@@ -838,6 +838,16 @@ mod tests {
     }
 
     #[test]
+    fn rekey_increments_key_epoch() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 1);
+        app.unlock(SecretString::new("first".into())).unwrap();
+        app.rekey(SecretString::new("second".into())).unwrap();
+        assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 2);
+    }
+
+    #[test]
     fn apply_writes_env_file() {
         let dir = tempfile::tempdir().unwrap();
         let app = unlocked_app();
