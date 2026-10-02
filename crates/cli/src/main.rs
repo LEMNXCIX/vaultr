@@ -572,6 +572,11 @@ fn main() -> Result<()> {
                         if count == 1 { "" } else { "s" },
                         if count == 1 { "" } else { "s" }
                     ),
+                    // Nothing to wipe, so nothing failed either: saying "falló"
+                    // here would report a failure that never happened.
+                    Err(e) if no_remote_vault(&e) => {
+                        println!("No hay vault remoto que borrar; el reset local está completo.");
+                    }
                     Err(e) => {
                         eprintln!("El reset local se completó, pero el borrado remoto falló: {e}");
                         eprintln!("El próximo `vltr sync` reintenta el borrado remoto.");
@@ -719,6 +724,21 @@ fn prompt_line_verbatim(prompt: &str) -> Result<String> {
 /// footgun pointed at the user's data.
 fn confirmation_matches(input: &str) -> bool {
     input == "RESET IT"
+}
+
+/// True when `reset_remote`'s error means "this account has no `vaults` row"
+/// rather than a failure — nothing was left to wipe, so the caller must not
+/// report a failed wipe.
+///
+/// Matched on the message because `core` returns a plain `CoreError::Other` for
+/// it and has no dedicated variant. If that message ever changes, this stops
+/// matching and the case falls back to the transport-failure branch, which
+/// warns instead of claiming success: the safe direction to fail.
+fn no_remote_vault(error: &vltr_core::CoreError) -> bool {
+    matches!(
+        error,
+        vltr_core::CoreError::Other(message) if message == "no vault found on the server"
+    )
 }
 
 fn resolve_project(app: &App, flag: Option<String>) -> Result<String> {
@@ -945,5 +965,19 @@ mod tests {
         ] {
             assert!(!confirmation_matches(rejected), "must reject {rejected:?}");
         }
+    }
+
+    #[test]
+    fn a_missing_remote_vault_is_not_a_failed_wipe() {
+        // Nothing to wipe, so nothing failed: this must not be reported as a
+        // failed remote wipe.
+        assert!(no_remote_vault(&vltr_core::CoreError::Other(
+            "no vault found on the server".into()
+        )));
+        // Every other failure keeps the warning-and-retry branch.
+        assert!(!no_remote_vault(&vltr_core::CoreError::Other(
+            "http error: status 500".into()
+        )));
+        assert!(!no_remote_vault(&vltr_core::CoreError::RemoteKeyChanged));
     }
 }

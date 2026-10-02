@@ -844,12 +844,22 @@ impl App {
     /// tombstone for every row. Needs no master key — a tombstone is a
     /// metadata write and the ciphertext travels through untouched.
     ///
-    /// The metadata pushed is the LOCAL one, read from storage, and only ever
-    /// the local one. The row this replaces describes the domain being wiped:
-    /// pushing its salt, kdf params or verifier would leave the server
-    /// advertising a key domain nobody holds while its rows are tombstoned
-    /// underneath it. This function therefore takes no remote row at all —
-    /// do not "fix" it by reintroducing one.
+    /// Two sources feed the row this pushes, and the split between them is the
+    /// whole point:
+    ///
+    /// * `salt`, `kdf_params`, `verifier_ct` and `verifier_nonce` are the LOCAL
+    ///   ones, read from storage. The row being replaced describes the domain
+    ///   being wiped, so publishing ITS salt, kdf params or verifier would
+    ///   leave the server advertising a key domain nobody holds while its rows
+    ///   sit tombstoned underneath it. The local verifier was encrypted under
+    ///   the local key, so it must travel with the params it was derived from.
+    /// * `key_epoch` is the single exception, and it comes from the remote row:
+    ///   `remote.key_epoch + 1`. The local epoch is only a placeholder from
+    ///   `reset_local`, which cannot know the server's counter, so writing it
+    ///   back could lower it. Adding to the remote's value is monotonic, so
+    ///   neither a reset nor a retry of an interrupted one can move the server
+    ///   backwards — and that is what keeps the next device's salt guard able to
+    ///   tell a reset from a password change.
     ///
     /// Idempotent: re-running re-tombstones already-dead rows, bumping their
     /// version and `updated_at`, which the LWW merge resolves the same way.
@@ -861,9 +871,7 @@ impl App {
         remote: &VaultRow,
     ) -> Result<usize, CoreError> {
         let meta = self.storage.get_vault_meta()?;
-        // The epoch is `remote + 1`, deliberately NOT `meta.key_epoch`: the local
-        // value is only a placeholder from `reset_local`, which cannot know the
-        // remote counter, and writing it back could lower the server's. This is
+        // The one field not taken from local meta; see the doc comment. This is
         // the opposite of the verifier backfill in `sync()`, which pushes the
         // LOCAL epoch because a backfill must not write a stale value over a
         // newer remote one — here the intent is to advance past the remote.
@@ -883,10 +891,21 @@ impl App {
             )
             .await?;
         // The push landed, so the placeholder is now stale: converge the local
-        // counter on the published one. Without this the next rekey would start
-        // from the placeholder and land behind the remote, which the salt guard
-        // reads as "another device moved the key" — with no way forward for a
-        // user whose previous password is the one that was lost.
+        // counter on the published one. Without it, the next rekey on THIS
+        // device starts from the placeholder and lands behind the remote — and
+        // because the remote row still carries `key_change = "reset"`, the salt
+        // guard then answers `RemoteReset` ("the remote vault was reset on
+        // another device") on the very device that performed the reset, which
+        // is a dead end for a user whose previous password is the one that was
+        // lost.
+        //
+        // `Storage::set_key_epoch` requires an audit before any flow bumps the
+        // epoch without rotating the salt. This is that audit: the verifier
+        // backfill cannot fire in a post-reset state, because it needs
+        // `Proceed` AND a remote row carrying no verifier, and every reset
+        // path writes one — so it can never republish a stale epoch over this
+        // one. The salt guard reads the epoch only inside the branch where the
+        // salts already differ, so this write is inert there.
         self.storage.set_key_epoch(target_epoch)?;
 
         let projects = client
@@ -1075,6 +1094,19 @@ impl App {
                         verifier_ct: Some(b64_encode(&ct)),
                         verifier_nonce: Some(b64_encode(&nonce)),
                         key_epoch: meta.key_epoch,
+                        // Hardcoded `init` / no timestamp, unlike the push above
+                        // which routes through `key_change_for`. Unreachable
+                        // today: this branch needs `Proceed` plus a remote row
+                        // with no verifier, and every reset path writes a
+                        // verifier, so a post-reset vault can never reach it.
+                        // It would become reachable only if a flow could leave a
+                        // verifier-less remote row behind, or if the backfill
+                        // stopped requiring `Proceed` — and because
+                        // `push_vault` upserts a whole row, this would then
+                        // silently rewrite a remote reset signal back to `init`
+                        // and hand the next device the adoption dead end
+                        // instead of an explanation. Route it through
+                        // `key_change_for` if that ever happens.
                         key_change: models::constants::KEY_CHANGE_INIT.into(),
                         key_changed_at: None,
                     },

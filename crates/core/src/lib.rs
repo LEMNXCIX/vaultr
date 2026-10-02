@@ -216,9 +216,10 @@ impl App {
     /// why this takes no epoch argument — an offline caller cannot know the
     /// remote counter, and a guessed value could only ever lower it.
     ///
-    /// Records `pending_local_reset` so a later sync pushes the matching
-    /// remote wipe, and clears any `pending_rekey_salt` — a reset subsumes
-    /// both markers, and only one may be active at a time.
+    /// Records `pending_local_reset`, stamped with the time of the reset, so a
+    /// later sync pushes the matching remote wipe; and clears any
+    /// `pending_rekey_salt` — a reset subsumes both markers, and only one may
+    /// be active at a time.
     ///
     /// Returns the local epoch installed.
     pub fn reset_local(&mut self, new_password: SecretString) -> Result<i64, CoreError> {
@@ -240,10 +241,16 @@ impl App {
             target_epoch,
         )?;
         SyncState::remove(self.storage.conn(), sync::PENDING_REKEY_SALT_KEY)?;
+        // The marker records WHEN the reset happened, not which epoch: the
+        // authoritative epoch is `remote + 1`, computed at push time, so a
+        // stored epoch here would be a second, wrong answer to a question
+        // nobody asks — `pending_reset()` only tests that the marker exists.
+        // The timestamp is what `key_changed_at` should report, since the push
+        // happens on a later sync, not now.
         SyncState::set(
             self.storage.conn(),
             sync::PENDING_LOCAL_RESET_KEY,
-            &target_epoch.to_string(),
+            &Utc::now().to_rfc3339(),
         )?;
         self.last_session_error = session::save_master_key(&new_key)
             .err()
@@ -974,6 +981,29 @@ mod tests {
         assert_eq!(
             SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn the_pending_reset_marker_records_when_the_reset_happened() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        let before = Utc::now();
+        app.reset_local(SecretString::new("second".into())).unwrap();
+        let after = Utc::now();
+
+        // A timestamp, not the placeholder epoch: the authoritative epoch is
+        // `remote + 1`, computed at push time, so storing one here would be a
+        // second wrong answer to a question nobody asks.
+        let marker = SyncState::get(app.storage.conn(), sync::PENDING_LOCAL_RESET_KEY)
+            .unwrap()
+            .unwrap();
+        let stamped = DateTime::parse_from_rfc3339(&marker)
+            .expect("the marker must be an RFC3339 timestamp")
+            .with_timezone(&Utc);
+        assert!(
+            stamped >= before - chrono::Duration::seconds(1) && stamped <= after,
+            "the marker must record the moment of the reset, got {marker}"
         );
     }
 
