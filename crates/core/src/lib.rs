@@ -174,6 +174,7 @@ impl App {
             &meta.kdf_params,
             &verifier_ct,
             &verifier_nonce,
+            meta.key_epoch + 1,
         )?;
 
         self.last_session_error = session::save_master_key(&new_key)

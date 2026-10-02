@@ -17,7 +17,7 @@ use storage::{Storage, SyncState, SyncTable};
 
 use crate::{App, CoreError};
 use crypto::{decrypt, derive_master_key, encrypt, MasterKey};
-use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow};
+use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow, VaultMetaPush};
 
 pub const SUPABASE_URL_ENV: &str = "VAULTR_SUPABASE_URL";
 pub const SUPABASE_KEY_ENV: &str = "VAULTR_SUPABASE_KEY";
@@ -644,6 +644,7 @@ impl App {
             &kdf_params,
             &verifier_ct,
             &verifier_nonce,
+            vault.key_epoch,
         )?;
 
         self.last_session_error = crate::session::save_master_key(&new_key)
@@ -665,7 +666,7 @@ impl App {
         // this vault was initialized independently); merging rows across them
         // would corrupt decryption on every device.
         let remote_vault = client.get_vault(&session).await?;
-        let mut vault_push: Option<(String, String)> = None;
+        let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
         if self.storage.is_initialized()? {
             let meta = self.storage.get_vault_meta()?;
@@ -678,10 +679,19 @@ impl App {
             match action {
                 SaltAction::Proceed => {}
                 SaltAction::PushLocal | SaltAction::PushRekey => {
-                    vault_push = Some((
-                        b64_encode(&meta.salt),
-                        serde_json::to_string(&meta.kdf_params)?,
-                    ));
+                    vault_push = Some(VaultMetaPush {
+                        salt: b64_encode(&meta.salt),
+                        kdf_params: serde_json::to_value(&meta.kdf_params)?,
+                        verifier_ct: Some(b64_encode(&meta.verifier_ct)),
+                        verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
+                        key_epoch: meta.key_epoch,
+                        key_change: if action == SaltAction::PushRekey {
+                            "rekey".into()
+                        } else {
+                            "init".into()
+                        },
+                        key_changed_at: None,
+                    });
                     clear_rekey_marker = action == SaltAction::PushRekey;
                 }
                 SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
@@ -694,8 +704,8 @@ impl App {
 
         // ---- Push: vault meta first (rows below are encrypted under the key
         // it describes), then dirty rows. ----
-        if let Some((salt_b64, kdf_json)) = vault_push {
-            client.push_vault(&session, &salt_b64, &kdf_json).await?;
+        if let Some(push) = &vault_push {
+            client.push_vault(&session, push).await?;
             report.pushed += 1;
             if clear_rekey_marker {
                 // Clear only after the push landed: on network failure the
