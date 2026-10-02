@@ -472,6 +472,33 @@ fn plan_pending_reset(remote_vault: Option<&VaultRow>) -> PendingResetPlan {
     }
 }
 
+/// The epoch a reset publishes: the remote's, plus one.
+///
+/// Computed at push time, where the remote row is in hand, so it can only ever
+/// advance the server's counter — a retry of an interrupted wipe cannot lower
+/// it, and the result is what [`salt_action`] needs to see on the next device
+/// (`remote_epoch > local_epoch`) to report a reset instead of a password
+/// change. Saturating rather than `+ 1`: an overflow panic inside a sync is
+/// worse than a counter that stops moving.
+fn reset_epoch_for(remote_epoch: i64) -> i64 {
+    remote_epoch.saturating_add(1)
+}
+
+/// Which `key_change` a vault-meta push publishes.
+///
+/// A `PushLocal` that finishes a pending reset creates the `vaults` row out of
+/// the post-reset domain, so it must publish the reset: `init` would tell
+/// another device that merely the master password changed, and the adoption
+/// it triggers re-pushes that device's pre-wipe rows over the reset. A rekey is
+/// its own signal and keeps its own label.
+fn key_change_for(action: SaltAction, finishing_reset: bool) -> &'static str {
+    match action {
+        SaltAction::PushRekey => models::constants::KEY_CHANGE_REKEY,
+        _ if finishing_reset => models::constants::KEY_CHANGE_RESET,
+        _ => models::constants::KEY_CHANGE_INIT,
+    }
+}
+
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
 
 /// Result of merging one pulled row.
@@ -827,8 +854,20 @@ impl App {
     /// Idempotent: re-running re-tombstones already-dead rows, bumping their
     /// version and `updated_at`, which the LWW merge resolves the same way.
     /// Returns the number of rows tombstoned.
-    async fn push_reset(&self, client: &SyncClient, session: &Session) -> Result<usize, CoreError> {
+    async fn push_reset(
+        &self,
+        client: &SyncClient,
+        session: &Session,
+        remote: &VaultRow,
+    ) -> Result<usize, CoreError> {
         let meta = self.storage.get_vault_meta()?;
+        // The epoch is `remote + 1`, deliberately NOT `meta.key_epoch`: the local
+        // value is only a placeholder from `reset_local`, which cannot know the
+        // remote counter, and writing it back could lower the server's. This is
+        // the opposite of the verifier backfill in `sync()`, which pushes the
+        // LOCAL epoch because a backfill must not write a stale value over a
+        // newer remote one — here the intent is to advance past the remote.
+        let target_epoch = reset_epoch_for(remote.key_epoch);
         client
             .push_vault(
                 session,
@@ -837,12 +876,18 @@ impl App {
                     kdf_params: serde_json::to_value(&meta.kdf_params)?,
                     verifier_ct: Some(b64_encode(&meta.verifier_ct)),
                     verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
-                    key_epoch: meta.key_epoch,
+                    key_epoch: target_epoch,
                     key_change: models::constants::KEY_CHANGE_RESET.into(),
                     key_changed_at: Some(Utc::now().to_rfc3339()),
                 },
             )
             .await?;
+        // The push landed, so the placeholder is now stale: converge the local
+        // counter on the published one. Without this the next rekey would start
+        // from the placeholder and land behind the remote, which the salt guard
+        // reads as "another device moved the key" — with no way forward for a
+        // user whose previous password is the one that was lost.
+        self.storage.set_key_epoch(target_epoch)?;
 
         let projects = client
             .pull_rows::<ProjectRow>(session, "projects", None)
@@ -881,10 +926,11 @@ impl App {
         }
         let client = sync_client()?;
         let session = fresh_session(&client).await?;
-        if client.get_vault(&session).await?.is_none() {
-            return Err(CoreError::Other("no vault found on the server".into()));
-        }
-        let count = self.push_reset(&client, &session).await?;
+        let remote = client
+            .get_vault(&session)
+            .await?
+            .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
+        let count = self.push_reset(&client, &session, &remote).await?;
         SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
         Ok(count)
     }
@@ -904,10 +950,17 @@ impl App {
         // A reset that was interrupted before its remote wipe landed must be
         // finished first. Left to the salt guard it would abort with
         // RemoteKeyChanged forever, since the local salt has already moved.
-        if self.pending_reset()? {
+        // `finished_reset` outlives the branch: when the account had no
+        // `vaults` row there is nothing to wipe, and the row this sync goes on
+        // to create is the reset's own domain, not a fresh `init`.
+        let finished_reset = self.pending_reset()?;
+        if finished_reset {
             match plan_pending_reset(remote_vault.as_ref()) {
                 PendingResetPlan::Wipe => {
-                    let count = self.push_reset(&client, &session).await?;
+                    let remote = remote_vault.as_ref().ok_or_else(|| {
+                        CoreError::Other("pending reset planned a wipe with no remote row".into())
+                    })?;
+                    let count = self.push_reset(&client, &session, remote).await?;
                     report.pushed += count + 1;
                     // Re-read the vault meta: the snapshot above predates the
                     // wipe, so the salt guard would compare the NEW local salt
@@ -948,24 +1001,21 @@ impl App {
             match salt_action_taken {
                 SaltAction::Proceed => {}
                 SaltAction::PushLocal | SaltAction::PushRekey => {
+                    let is_rekey = salt_action_taken == SaltAction::PushRekey;
                     vault_push = Some(VaultMetaPush {
                         salt: b64_encode(&meta.salt),
                         kdf_params: serde_json::to_value(&meta.kdf_params)?,
                         verifier_ct: Some(b64_encode(&meta.verifier_ct)),
                         verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
                         key_epoch: meta.key_epoch,
-                        key_change: if salt_action_taken == SaltAction::PushRekey {
-                            models::constants::KEY_CHANGE_REKEY.into()
-                        } else {
-                            models::constants::KEY_CHANGE_INIT.into()
-                        },
-                        key_changed_at: if salt_action_taken == SaltAction::PushRekey {
+                        key_change: key_change_for(salt_action_taken, finished_reset).into(),
+                        key_changed_at: if is_rekey || finished_reset {
                             Some(Utc::now().to_rfc3339())
                         } else {
                             None
                         },
                     });
-                    clear_rekey_marker = salt_action_taken == SaltAction::PushRekey;
+                    clear_rekey_marker = is_rekey;
                 }
                 SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
                 SaltAction::RemoteReset => {
@@ -1527,6 +1577,52 @@ mod tests {
         // No `vaults` row: nothing to wipe, so the marker is already
         // satisfied and is cleared without any network write.
         assert_eq!(plan_pending_reset(None), PendingResetPlan::AlreadyWiped);
+    }
+
+    #[test]
+    fn reset_epoch_is_always_ahead_of_the_remote_and_never_lowers_it() {
+        // The reset must advance past whatever the server holds, so another
+        // device sees `remote_epoch > local_epoch && key_change == "reset"` and
+        // stops instead of adopting and re-pushing its pre-wipe rows.
+        assert_eq!(reset_epoch_for(7), 8);
+        assert_eq!(reset_epoch_for(0), 1, "a vault predating the epoch reads 0");
+        for remote in [1i64, 2, 7, 99, i64::MAX] {
+            assert!(
+                reset_epoch_for(remote) >= remote,
+                "a retry of the wipe can never lower {remote}"
+            );
+        }
+        assert_eq!(
+            reset_epoch_for(i64::MAX),
+            i64::MAX,
+            "saturation beats an overflow panic in a sync path"
+        );
+    }
+
+    #[test]
+    fn a_push_local_that_finishes_a_reset_publishes_the_reset() {
+        assert_eq!(
+            key_change_for(SaltAction::PushLocal, false),
+            models::constants::KEY_CHANGE_INIT
+        );
+        // The account had no `vaults` row, so this sync creates it out of the
+        // post-reset domain: publishing `init` would tell another device that
+        // merely the master password changed, which leads it to adopt and push
+        // its wiped rows back.
+        assert_eq!(
+            key_change_for(SaltAction::PushLocal, true),
+            models::constants::KEY_CHANGE_RESET
+        );
+        // A rekey is its own signal and never relabels as a reset, even if a
+        // reset marker was also pending.
+        assert_eq!(
+            key_change_for(SaltAction::PushRekey, false),
+            models::constants::KEY_CHANGE_REKEY
+        );
+        assert_eq!(
+            key_change_for(SaltAction::PushRekey, true),
+            models::constants::KEY_CHANGE_REKEY
+        );
     }
 
     #[test]
