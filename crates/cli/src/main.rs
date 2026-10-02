@@ -142,6 +142,14 @@ enum Commands {
     Restore { backup: PathBuf },
     /// Change the master password (re-encrypts the vault with a new key)
     Rekey,
+    /// Destroy the vault and start over with a new master password, for when
+    /// the current one is lost. This is NOT a recovery. Requires typing
+    /// RESET IT to confirm.
+    Reset {
+        /// Reset only this device; the remote wipe happens on the next `vltr sync`
+        #[arg(long)]
+        local: bool,
+    },
     /// Log in to Supabase sync (see docs/SYNC.md for required env vars)
     Login,
     /// Create a Supabase sync account (see docs/SYNC.md)
@@ -504,6 +512,83 @@ fn main() -> Result<()> {
             println!("Run `vltr sync` to propagate the new key to other devices.");
             print_session_status(&mut app);
         }
+        Commands::Reset { local } => {
+            let mut app = App::open(&db_path)?;
+            if !app.is_initialized()? {
+                bail!("Vault not initialized. Nothing to reset.");
+            }
+            // `--local` skips the remote wipe *now*, not this check: the epoch a
+            // reset installs is the epoch that wipe pushes to the server.
+            if !local && !(App::sync_available_config() && App::sync_session_exists()) {
+                bail!(
+                    "Reset necesita una sesión de Supabase para leer el key_epoch remoto: ejecuta \
+                     `vltr login` y repite. `--local` tampoco sirve aquí: difiere el borrado \
+                     remoto, no la lectura del epoch."
+                );
+            }
+            // Everything from here to the confirmation is read-only: no write, no
+            // network call, no session saved. The vault is only touched below.
+            println!("Esto NO es una recuperación.");
+            println!(
+                "Se destruye el vault local ({}): todos sus proyectos, entornos y variables.",
+                db_path.display()
+            );
+            if local {
+                println!("El vault remoto no se toca ahora: se borrará en el próximo `vltr sync`.");
+            } else {
+                println!("También se borra el vault remoto: sus secretos vivos quedan eliminados.");
+            }
+            println!(
+                "Lo cifrado con la contraseña perdida NO se puede recuperar. Lo único que puede \
+                 salvarlo es un backup hecho antes del último `vltr rekey`."
+            );
+            let typed = prompt_line_verbatim("Type RESET IT to confirm: ")?;
+            if !confirmation_matches(&typed) {
+                bail!("Confirmation phrase does not match. Nothing was changed.");
+            }
+            let new = prompt_password("New master password: ")?;
+            let confirm = prompt_password("Confirm new master password: ")?;
+            if !crypto::passwords_match(&new, &confirm) {
+                bail!("Passwords do not match");
+            }
+            let has_remote = if !App::sync_available_config() {
+                bail!(
+                    "Reset necesita Supabase para leer el key_epoch remoto: sync no configurado \
+                     (ver docs/SYNC.md). `--local` no lo evita — el epoch es precisamente lo \
+                     que el borrado remoto sube al servidor."
+                );
+            } else {
+                match block_on(App::remote_has_vault()) {
+                    Ok(has) => has,
+                    Err(e) => bail!("Sin conexión con Supabase: {e}"),
+                }
+            };
+            let target_epoch = reset_target_epoch(has_remote)?;
+            app.reset_local(new, target_epoch)?;
+            println!(
+                "Vault local destruido y reiniciado con nueva contraseña maestra (key_epoch \
+                 {target_epoch})."
+            );
+            print_session_status(&mut app);
+            if local {
+                println!("El próximo `vltr sync` termina el borrado del vault remoto.");
+            } else {
+                // A failed remote wipe is not a failed reset: the local vault is
+                // already the new domain and `pending_local_reset` survives for
+                // the next `vltr sync` to retry.
+                match block_on(app.reset_remote()) {
+                    Ok(count) => println!(
+                        "Vault remoto borrado: {count} fila{} eliminada{}.",
+                        if count == 1 { "" } else { "s" },
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    Err(e) => {
+                        eprintln!("El reset local se completó, pero el borrado remoto falló: {e}");
+                        eprintln!("El próximo `vltr sync` reintenta el borrado remoto.");
+                    }
+                }
+            }
+        }
         Commands::Login => {
             require_sync_config()?;
             let app = App::open(&db_path)?;
@@ -622,6 +707,55 @@ fn prompt_line(prompt: &str) -> Result<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+/// Read one line verbatim: the prompt is printed exactly as given and only the
+/// trailing line terminator is stripped. [`prompt_line`] trims because its
+/// callers (project names, emails) want that; a confirmation phrase must be
+/// compared exactly as typed, so trimming would turn a footgun into a shortcut.
+fn prompt_line_verbatim(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let line = line.strip_suffix('\n').unwrap_or(&line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    Ok(line.to_owned())
+}
+
+/// The reset confirmation phrase, matched exactly: not trimmed, not case-folded,
+/// not whitespace-collapsed. This phrase arms a destructive, irreversible wipe
+/// of a vault that may be the last copy of its contents, so a fuzzy match is a
+/// footgun pointed at the user's data.
+fn confirmation_matches(input: &str) -> bool {
+    input == "RESET IT"
+}
+
+/// The `key_epoch` a reset must install locally: `remote.key_epoch + 1`, or `1`
+/// when the account has no `vaults` row.
+///
+/// The value is load-bearing in a way that is easy to miss. The remote half of
+/// the reset pushes the LOCAL epoch to the server, and another device only
+/// learns that a reset happened when the remote epoch is *ahead* of its own
+/// (`salt_action` → `RemoteReset`). An epoch that is too low is not cosmetic:
+/// the other device is merely told the master password changed, asked for it,
+/// and on answering it re-encrypts and re-pushes its pre-wipe rows — resurrecting
+/// exactly what this command exists to destroy.
+///
+/// `core` exposes `App::remote_has_vault()` (a bool) but no accessor for
+/// `vaults.key_epoch`, so the online case cannot be computed from the CLI. Until
+/// it can, refuse rather than install an epoch that is known to be wrong.
+fn reset_target_epoch(has_remote_vault: bool) -> Result<i64> {
+    if has_remote_vault {
+        bail!(
+            "vltr reset no puede calcular el key_epoch remoto: `core` expone \
+             `remote_has_vault()` pero no `vaults.key_epoch`. Un epoch estimado bajaría \
+             el key_epoch del servidor, y el otro dispositivo no reconocería el reset: \
+             adoptaría la contraseña nueva y volvería a subir sus filas anteriores al \
+             borrado. Falta `App::remote_key_epoch()` en core para hacerlo bien."
+        );
+    }
+    Ok(1)
 }
 
 fn resolve_project(app: &App, flag: Option<String>) -> Result<String> {
@@ -827,5 +961,26 @@ fn mask(value: &str) -> String {
         "****".to_string()
     } else {
         format!("{}…{}", &value[..4], &value[value.len() - 4..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_requires_the_exact_phrase() {
+        assert!(confirmation_matches("RESET IT"));
+        for rejected in [
+            "",
+            "reset it",
+            "RESET",
+            "RESET  IT",
+            " RESET IT",
+            "RESET IT ",
+            "RESET IT.",
+        ] {
+            assert!(!confirmation_matches(rejected), "must reject {rejected:?}");
+        }
     }
 }
