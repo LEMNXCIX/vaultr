@@ -390,18 +390,31 @@ enum SaltAction {
 /// The salt is not secret; it only identifies the key domain. Mixing rows
 /// from two domains leaves ciphertexts nobody can decrypt, so any mismatch
 /// without a matching local rekey marker must stop the sync.
-fn salt_action(
-    local_salt: &[u8],
-    remote_salt_b64: Option<&str>,
-    pending_marker: Option<&str>,
-) -> SaltAction {
-    let Some(remote) = remote_salt_b64 else {
+/// Local and remote vault state, gathered by the caller so this stays pure.
+struct SaltInputs<'a> {
+    local_salt: &'a [u8],
+    local_epoch: i64,
+    remote_salt_b64: Option<&'a str>,
+    remote_epoch: Option<i64>,
+    pending_marker: Option<&'a str>,
+}
+
+fn salt_action(i: &SaltInputs) -> SaltAction {
+    let Some(remote) = i.remote_salt_b64 else {
         return SaltAction::PushLocal;
     };
-    if remote == b64_encode(local_salt) {
+    if remote == b64_encode(i.local_salt) {
         return SaltAction::Proceed;
     }
-    if pending_marker.is_some_and(|m| m == hex::encode(local_salt)) {
+    // Salt differs. A remote that has rotated past us wins even when this
+    // device holds a pending rekey marker: our meta is stale and pushing it
+    // would clobber a newer key domain.
+    if i.remote_epoch.is_some_and(|re| re > i.local_epoch) {
+        return SaltAction::RemoteKeyChanged;
+    }
+    if i.pending_marker
+        .is_some_and(|m| m == hex::encode(i.local_salt))
+    {
         return SaltAction::PushRekey;
     }
     SaltAction::RemoteKeyChanged
@@ -703,15 +716,22 @@ impl App {
         let remote_vault = client.get_vault(&session).await?;
         let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
+        // Hoisted for a later epoch task that reads the guard outcome after
+        // this block. The init value covers the uninitialized-vault path.
+        #[allow(unused_assignments)]
+        let mut salt_action_taken = SaltAction::Proceed;
         if self.storage.is_initialized()? {
             let meta = self.storage.get_vault_meta()?;
             let pending = SyncState::get(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
-            let action = salt_action(
-                &meta.salt,
-                remote_vault.as_ref().map(|v| v.salt.as_str()),
-                pending.as_deref(),
-            );
-            match action {
+            let inputs = SaltInputs {
+                local_salt: &meta.salt,
+                local_epoch: meta.key_epoch,
+                remote_salt_b64: remote_vault.as_ref().map(|v| v.salt.as_str()),
+                remote_epoch: remote_vault.as_ref().map(|v| v.key_epoch),
+                pending_marker: pending.as_deref(),
+            };
+            salt_action_taken = salt_action(&inputs);
+            match salt_action_taken {
                 SaltAction::Proceed => {}
                 SaltAction::PushLocal | SaltAction::PushRekey => {
                     vault_push = Some(VaultMetaPush {
@@ -720,14 +740,18 @@ impl App {
                         verifier_ct: Some(b64_encode(&meta.verifier_ct)),
                         verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
                         key_epoch: meta.key_epoch,
-                        key_change: if action == SaltAction::PushRekey {
-                            "rekey".into()
+                        key_change: if salt_action_taken == SaltAction::PushRekey {
+                            models::constants::KEY_CHANGE_REKEY.into()
                         } else {
-                            "init".into()
+                            models::constants::KEY_CHANGE_INIT.into()
                         },
-                        key_changed_at: None,
+                        key_changed_at: if salt_action_taken == SaltAction::PushRekey {
+                            Some(Utc::now().to_rfc3339())
+                        } else {
+                            None
+                        },
                     });
-                    clear_rekey_marker = action == SaltAction::PushRekey;
+                    clear_rekey_marker = salt_action_taken == SaltAction::PushRekey;
                 }
                 SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
             }
@@ -1072,6 +1096,20 @@ mod tests {
         assert_eq!(storage.dirty_variables().unwrap().len(), 1);
     }
 
+    fn salt_inputs<'a>(
+        local: &'a [u8],
+        remote: Option<&'a str>,
+        marker: Option<&'a str>,
+    ) -> SaltInputs<'a> {
+        SaltInputs {
+            local_salt: local,
+            local_epoch: 1,
+            remote_salt_b64: remote,
+            remote_epoch: None,
+            pending_marker: marker,
+        }
+    }
+
     #[test]
     fn salt_guard_covers_all_four_branches() {
         let local = [9u8; 16];
@@ -1080,39 +1118,86 @@ mod tests {
         let other_b64 = b64_encode(&[8u8; 16]);
 
         // Remote has no vault → push local meta (first sync).
-        assert_eq!(salt_action(&local, None, None), SaltAction::PushLocal);
         assert_eq!(
-            salt_action(&local, None, Some(&local_hex)),
+            salt_action(&salt_inputs(&local, None, None)),
+            SaltAction::PushLocal
+        );
+        assert_eq!(
+            salt_action(&salt_inputs(&local, None, Some(&local_hex))),
             SaltAction::PushLocal
         );
 
         // Salts equal → normal sync regardless of a (stale) marker.
         assert_eq!(
-            salt_action(&local, Some(&local_b64), None),
+            salt_action(&salt_inputs(&local, Some(&local_b64), None)),
             SaltAction::Proceed
         );
         assert_eq!(
-            salt_action(&local, Some(&local_b64), Some(&local_hex)),
+            salt_action(&salt_inputs(&local, Some(&local_b64), Some(&local_hex))),
             SaltAction::Proceed
         );
 
         // Salts differ + marker matches THIS device's salt → rekeyed here:
         // push the new meta before the rows.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), Some(&local_hex)),
+            salt_action(&salt_inputs(&local, Some(&other_b64), Some(&local_hex))),
             SaltAction::PushRekey
         );
 
         // Salts differ, no marker → abort, nothing pushed or pulled.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), None),
+            salt_action(&salt_inputs(&local, Some(&other_b64), None)),
             SaltAction::RemoteKeyChanged
         );
         // A marker for a different salt must not authorize the push.
         assert_eq!(
-            salt_action(&local, Some(&other_b64), Some("deadbeef")),
+            salt_action(&salt_inputs(&local, Some(&other_b64), Some("deadbeef"))),
             SaltAction::RemoteKeyChanged
         );
+    }
+
+    #[test]
+    fn remote_epoch_ahead_blocks_a_stale_local_rekey() {
+        // This device rekeyed and has a pending marker, but the remote has
+        // since rotated again. Pushing our stale meta would clobber it.
+        let local = [1u8; 16];
+        let local_hex = hex::encode(local);
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 2,
+            remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
+            remote_epoch: Some(3),
+            pending_marker: Some(&local_hex),
+        };
+        assert_eq!(salt_action(&i), SaltAction::RemoteKeyChanged);
+    }
+
+    #[test]
+    fn remote_epoch_ahead_with_matching_salt_still_proceeds() {
+        // Salts match, so the key domains agree; a higher remote epoch is
+        // bookkeeping, not a reason to abort.
+        let local = [1u8; 16];
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 1,
+            remote_salt_b64: Some(&b64_encode(&local)),
+            remote_epoch: Some(9),
+            pending_marker: None,
+        };
+        assert_eq!(salt_action(&i), SaltAction::Proceed);
+    }
+
+    #[test]
+    fn remote_epoch_behind_does_not_block_our_newer_rekey() {
+        let local = [1u8; 16];
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 5,
+            remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
+            remote_epoch: Some(4),
+            pending_marker: Some(&hex::encode(local)),
+        };
+        assert_eq!(salt_action(&i), SaltAction::PushRekey);
     }
 
     #[test]
