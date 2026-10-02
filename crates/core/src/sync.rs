@@ -795,6 +795,16 @@ impl App {
     /// The pull cursor is deliberately untouched: rows merge normally on the
     /// re-run. No rekey marker is needed — local now equals remote.
     /// The vault must be unlocked.
+    ///
+    /// Also serves the divergence prompt's "keep local" choice, which is the
+    /// `RemoteReset` case of the same divergence — and that is why the rotation
+    /// here re-dirties projects and environments while `App::rekey` does not:
+    /// adoption is what follows a remote reset, and a reset tombstoned every
+    /// server row with a newer `updated_at`. Only the variables were being
+    /// re-queued, so the retry's push left the parents' tombstones standing and
+    /// the pull that followed deleted the project the user had asked to keep.
+    /// See [`Storage::apply_key_rotation_dirtying_parents`], which also
+    /// explains why a rekey must keep paying for variables only.
     pub async fn adopt_remote_key(&mut self, password: SecretString) -> Result<(), CoreError> {
         if !self.storage.is_initialized()? {
             return Err(CoreError::Other("vault not initialized".into()));
@@ -824,7 +834,10 @@ impl App {
 
         let (verifier_ct, verifier_nonce) =
             encrypt(&new_key, models::constants::VAULT_VERIFIER_MESSAGE)?;
-        self.storage.apply_key_rotation(
+        // Not `apply_key_rotation`: adoption must also re-queue the parents,
+        // or a post-reset retry pushes no project/environment rows and the
+        // reset's tombstones win the following pull. See this method's doc.
+        self.storage.apply_key_rotation_dirtying_parents(
             &reencrypted,
             &remote_salt,
             &kdf_params,

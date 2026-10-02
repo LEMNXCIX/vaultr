@@ -199,6 +199,72 @@ impl Storage {
         verifier_nonce: &[u8],
         key_epoch: i64,
     ) -> Result<(), StorageError> {
+        self.apply_key_rotation_within(
+            reencrypted,
+            salt,
+            kdf_params,
+            verifier_ct,
+            verifier_nonce,
+            key_epoch,
+            false,
+        )
+    }
+
+    /// [`Self::apply_key_rotation`] PLUS re-queuing every project and
+    /// environment for push, inside the SAME transaction.
+    ///
+    /// Why the adoption path needs this and a plain rekey does not. Adoption is
+    /// what follows a remote **reset**, and the reset left a tombstone for
+    /// every row on the server, each with a NEWER `updated_at` than anything
+    /// this device holds. `apply_key_rotation` re-encrypts and re-dirties
+    /// variables only, so on a device that had already synced the parents were
+    /// not in the dirty set at all: the retry's push left their tombstones in
+    /// place, the pull that followed won LWW against them, and
+    /// `cascade_tombstones` took the children with them. The user had chosen to
+    /// keep the vault and got it back flagged deleted.
+    ///
+    /// Re-queuing rather than editing is the point: `updated_at` and `version`
+    /// stay exactly as they are, so the push replaces each tombstone by primary
+    /// key (`resolution=merge-duplicates`) and the pull after it has no newer
+    /// row to bring the deletion back with. A plain rekey changes neither the
+    /// parents' names nor their contents, so re-pushing them would be pure
+    /// waste — which is why this is a separate method rather than a flag every
+    /// rotation sets. Do not fold it into `apply_key_rotation`.
+    ///
+    /// Same transaction as the rotation, deliberately: a rotation that landed
+    /// while the parents stayed clean is the silent data loss above, and a
+    /// parents-only write that landed while the rotation failed would leave
+    /// rows re-encrypted under a key `vault_meta` does not describe.
+    pub fn apply_key_rotation_dirtying_parents(
+        &self,
+        reencrypted: &[(Id, Vec<u8>, Vec<u8>)],
+        salt: &[u8],
+        kdf_params: &KdfParams,
+        verifier_ct: &[u8],
+        verifier_nonce: &[u8],
+        key_epoch: i64,
+    ) -> Result<(), StorageError> {
+        self.apply_key_rotation_within(
+            reencrypted,
+            salt,
+            kdf_params,
+            verifier_ct,
+            verifier_nonce,
+            key_epoch,
+            true,
+        )
+    }
+
+    fn apply_key_rotation_within(
+        &self,
+        reencrypted: &[(Id, Vec<u8>, Vec<u8>)],
+        salt: &[u8],
+        kdf_params: &KdfParams,
+        verifier_ct: &[u8],
+        verifier_nonce: &[u8],
+        key_epoch: i64,
+        dirty_parents: bool,
+    ) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         for (id, ciphertext, nonce) in reencrypted {
             let n = tx.execute(
@@ -212,6 +278,12 @@ impl Storage {
                     "variable {id} disappeared during key rotation"
                 )));
             }
+        }
+        if dirty_parents {
+            // Every row, tombstoned or not: a local tombstone must overwrite
+            // the remote one too, and a live one must un-tombstone it.
+            tx.execute("UPDATE projects SET synced_at = NULL", [])?;
+            tx.execute("UPDATE environments SET synced_at = NULL", [])?;
         }
         let params_json = serde_json::to_string(kdf_params)?;
         let updated = tx.execute(
@@ -1151,6 +1223,138 @@ mod tests {
         assert_eq!(s.all_variables().unwrap().len(), 1);
         assert!(s.delete_variable(e.id, "K").unwrap());
         assert_eq!(s.all_variables().unwrap().len(), 1, "tombstones included");
+    }
+
+    #[test]
+    fn adoption_rotation_requeues_parents_and_a_plain_rekey_does_not() {
+        // A device that had already synced before a remote reset: nothing is
+        // dirty, which is exactly the state that made the "keep local"
+        // adoption push no parents.
+        let s = synced_vault_with_one_variable();
+        let project_id = s.get_project_by_name("P").unwrap().unwrap().id;
+        let env_id = s.list_environments(project_id).unwrap()[0].id;
+        let var = s.all_variables().unwrap().pop().unwrap();
+        assert!(
+            s.dirty_projects().unwrap().is_empty()
+                && s.dirty_environments().unwrap().is_empty()
+                && s.dirty_variables().unwrap().is_empty(),
+            "precondition: this device had fully synced"
+        );
+        let project_before = s.find_project_by_id(project_id).unwrap().unwrap();
+        let env_before = s.find_environment_by_id(env_id).unwrap().unwrap();
+        let reencrypted = vec![(var.id, vec![9, 9, 9], vec![1; 24])];
+
+        // The adoption path: parents must go back to the dirty set so their
+        // live rows overwrite the reset's tombstones before the pull runs.
+        s.apply_key_rotation_dirtying_parents(
+            &reencrypted,
+            &[3u8; 16],
+            &KdfParams::default(),
+            b"ct3",
+            b"nonce3",
+            9,
+        )
+        .unwrap();
+
+        let dirty_projects = s.dirty_projects().unwrap();
+        assert_eq!(dirty_projects.len(), 1, "the project must be re-pushed");
+        assert_eq!(dirty_projects[0].id, project_id);
+        assert!(!dirty_projects[0].deleted, "re-queuing must not tombstone");
+        let dirty_envs = s.dirty_environments().unwrap();
+        assert_eq!(dirty_envs.len(), 1, "the environment must be re-pushed");
+        assert_eq!(dirty_envs[0].id, env_id);
+        assert!(!dirty_envs[0].deleted, "re-queuing must not tombstone");
+        assert_eq!(s.dirty_variables().unwrap().len(), 1, "variables too");
+
+        // Same LWW contract as a plain rotation: the push overwrites the
+        // tombstone server-side by primary key, so no timestamp may move —
+        // a bumped `updated_at` would also be what makes the following pull
+        // unable to resurrect the deletion.
+        let project_after = s.find_project_by_id(project_id).unwrap().unwrap();
+        assert_eq!(project_after.updated_at, project_before.updated_at);
+        assert_eq!(project_after.version, project_before.version);
+        let env_after = s.find_environment_by_id(env_id).unwrap().unwrap();
+        assert_eq!(env_after.updated_at, env_before.updated_at);
+        assert_eq!(s.get_vault_meta().unwrap().key_epoch, 9);
+    }
+
+    #[test]
+    fn a_plain_key_rotation_leaves_parents_clean() {
+        // The other half of the contract, and the reason the adoption path has
+        // its own method instead of a global rule: on a rekey the parents'
+        // names and contents are unchanged, so re-pushing them would be pure
+        // waste. If this test ever fails, a global "always redirty parents"
+        // has crept in.
+        let s = synced_vault_with_one_variable();
+        let project_id = s.get_project_by_name("P").unwrap().unwrap().id;
+        let var = s.all_variables().unwrap().pop().unwrap();
+        s.apply_key_rotation(
+            &[(var.id, vec![9, 9, 9], vec![1; 24])],
+            &[4u8; 16],
+            &KdfParams::default(),
+            b"ct4",
+            b"nonce4",
+            2,
+        )
+        .unwrap();
+
+        assert!(
+            s.dirty_projects().unwrap().is_empty(),
+            "rekey must not push parents"
+        );
+        assert!(
+            s.dirty_environments().unwrap().is_empty(),
+            "rekey must not push parents"
+        );
+        assert_eq!(s.dirty_variables().unwrap().len(), 1, "variables only");
+        assert!(
+            !s.find_project_by_id(project_id).unwrap().unwrap().deleted,
+            "a rotation never deletes anything locally either"
+        );
+    }
+
+    /// An initialized vault holding one project, one environment and one
+    /// variable, all three already marked synced.
+    fn synced_vault_with_one_variable() -> Storage {
+        let s = Storage::open_in_memory().unwrap();
+        s.init_vault(&[1u8; 16], &KdfParams::default(), b"ct", b"nonce")
+            .unwrap();
+        let now = Utc::now();
+        let p = Project {
+            id: Uuid::now_v7(),
+            name: "P".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            owner_id: None,
+            version: 1,
+            deleted: false,
+        };
+        s.create_project(&p).unwrap();
+        let e = Environment {
+            id: Uuid::now_v7(),
+            project_id: p.id,
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        s.create_environment(&e).unwrap();
+        let v = sample_var(e.id, "K");
+        s.create_variable(&v).unwrap();
+        // As a completed sync would leave them: stamped, so not dirty.
+        let stamped = now + chrono::Duration::seconds(1);
+        s.mark_synced(SyncTable::Projects, &[p.id], stamped)
+            .unwrap();
+        s.mark_synced(SyncTable::Environments, &[e.id], stamped)
+            .unwrap();
+        s.mark_synced(SyncTable::Variables, &[v.id], stamped)
+            .unwrap();
+        s
     }
 
     #[test]
