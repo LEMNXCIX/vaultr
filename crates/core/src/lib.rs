@@ -1,7 +1,7 @@
 //! Business logic / use cases.
 //! This is the only layer that CLI and Desktop should talk to.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crypto::{decrypt, derive_master_key, encrypt, generate_salt, MasterKey};
 use models::{DecryptedVariable, Environment, KdfParams, Project, Variable, VariableSummary};
 use secrecy::SecretString;
@@ -13,6 +13,16 @@ pub mod backup;
 pub mod envfile;
 pub mod session;
 pub mod sync;
+
+/// The remote vault was reset on another device: its epoch advanced and
+/// `key_change` says `reset`. Adopting automatically would push this
+/// device's pre-wipe rows back over the reset, so the caller must ask.
+#[derive(Debug, Clone)]
+pub struct RemoteResetInfo {
+    pub remote_epoch: i64,
+    pub key_change: Option<String>,
+    pub key_changed_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -33,6 +43,11 @@ pub enum CoreError {
     /// or this vault was initialized independently. Nothing was pushed/pulled.
     #[error("the vault master key changed on another device")]
     RemoteKeyChanged,
+    /// The remote vault was reset on another device (epoch advanced, key
+    /// change says `reset`). Carries only epoch metadata — no key material,
+    /// nothing decrypted.
+    #[error("the remote vault was reset on another device")]
+    RemoteReset(RemoteResetInfo),
     /// The remote `vaults` row carries `verifier_ct` without `verifier_nonce`.
     /// Refusing to sync beats verifying against a half-written row.
     #[error("the remote vault verifier is incomplete (ciphertext without nonce)")]

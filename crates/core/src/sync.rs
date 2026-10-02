@@ -15,7 +15,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{Storage, SyncState, SyncTable};
 
-use crate::{App, CoreError};
+use crate::{App, CoreError, RemoteResetInfo};
 use crypto::{decrypt, derive_master_key, encrypt, MasterKey};
 use sync::{EnvironmentRow, ProjectRow, Session, SyncClient, VariableRow, VaultMetaPush, VaultRow};
 
@@ -383,6 +383,11 @@ enum SaltAction {
     PushRekey,
     /// Remote key changed elsewhere: abort WITHOUT pushing or pulling.
     RemoteKeyChanged,
+    /// The remote vault was reset on another device: abort WITHOUT pushing
+    /// or pulling, and the caller must ask the user rather than adopt,
+    /// because adopting would push this device's pre-wipe rows back over
+    /// the wipe.
+    RemoteReset,
 }
 
 /// Decide how to reconcile local and remote vault salts.
@@ -396,6 +401,7 @@ struct SaltInputs<'a> {
     local_epoch: i64,
     remote_salt_b64: Option<&'a str>,
     remote_epoch: Option<i64>,
+    remote_key_change: Option<&'a str>,
     pending_marker: Option<&'a str>,
 }
 
@@ -405,6 +411,15 @@ fn salt_action(i: &SaltInputs) -> SaltAction {
     };
     if remote == b64_encode(i.local_salt) {
         return SaltAction::Proceed;
+    }
+    // Salt differs. A remote reset elsewhere wins over everything in this
+    // branch — even a pending rekey marker from this device, which must be
+    // stale if the remote was wiped after it: pushing our salt back would
+    // resurrect pre-wipe rows over the reset.
+    if i.remote_epoch.is_some_and(|re| re > i.local_epoch)
+        && i.remote_key_change == Some(models::constants::KEY_CHANGE_RESET)
+    {
+        return SaltAction::RemoteReset;
     }
     // Salt differs. A remote that has rotated past us wins even when this
     // device holds a pending rekey marker: our meta is stale and pushing it
@@ -734,6 +749,7 @@ impl App {
                 local_epoch: meta.key_epoch,
                 remote_salt_b64: remote_vault.as_ref().map(|v| v.salt.as_str()),
                 remote_epoch: remote_vault.as_ref().map(|v| v.key_epoch),
+                remote_key_change: remote_vault.as_ref().and_then(|v| v.key_change.as_deref()),
                 pending_marker: pending.as_deref(),
             };
             salt_action_taken = salt_action(&inputs);
@@ -760,6 +776,16 @@ impl App {
                     clear_rekey_marker = salt_action_taken == SaltAction::PushRekey;
                 }
                 SaltAction::RemoteKeyChanged => return Err(CoreError::RemoteKeyChanged),
+                SaltAction::RemoteReset => {
+                    let v = remote_vault.as_ref().ok_or_else(|| {
+                        CoreError::Other("remote reset detected without a remote row".into())
+                    })?;
+                    return Err(CoreError::RemoteReset(RemoteResetInfo {
+                        remote_epoch: v.key_epoch,
+                        key_change: v.key_change.clone(),
+                        key_changed_at: v.key_changed_at,
+                    }));
+                }
             }
         }
 
@@ -1146,6 +1172,7 @@ mod tests {
             local_epoch: 1,
             remote_salt_b64: remote,
             remote_epoch: None,
+            remote_key_change: None,
             pending_marker: marker,
         }
     }
@@ -1207,6 +1234,7 @@ mod tests {
             local_epoch: 2,
             remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
             remote_epoch: Some(3),
+            remote_key_change: None,
             pending_marker: Some(&local_hex),
         };
         assert_eq!(salt_action(&i), SaltAction::RemoteKeyChanged);
@@ -1222,6 +1250,7 @@ mod tests {
             local_epoch: 1,
             remote_salt_b64: Some(&b64_encode(&local)),
             remote_epoch: Some(9),
+            remote_key_change: None,
             pending_marker: None,
         };
         assert_eq!(salt_action(&i), SaltAction::Proceed);
@@ -1235,9 +1264,75 @@ mod tests {
             local_epoch: 5,
             remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
             remote_epoch: Some(4),
+            remote_key_change: None,
             pending_marker: Some(&hex::encode(local)),
         };
         assert_eq!(salt_action(&i), SaltAction::PushRekey);
+    }
+
+    #[test]
+    fn remote_reset_is_distinguished_from_a_remote_rekey() {
+        let local = [1u8; 16];
+        let other = b64_encode(&[2u8; 16]);
+
+        let mut i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 1,
+            remote_salt_b64: Some(&other),
+            remote_epoch: Some(3),
+            remote_key_change: Some(models::constants::KEY_CHANGE_RESET),
+            pending_marker: None,
+        };
+        assert_eq!(salt_action(&i), SaltAction::RemoteReset);
+
+        // Same shape, but the remote rotated the key rather than being reset.
+        i.remote_key_change = Some(models::constants::KEY_CHANGE_REKEY);
+        assert_eq!(
+            salt_action(&i),
+            SaltAction::RemoteKeyChanged,
+            "a rekey elsewhere keeps the guided adoption flow"
+        );
+
+        // A pre-migration remote row has no key_change: stay conservative.
+        i.remote_key_change = None;
+        assert_eq!(salt_action(&i), SaltAction::RemoteKeyChanged);
+    }
+
+    #[test]
+    fn remote_reset_never_triggers_on_matching_salt_or_lower_epoch() {
+        let local = [1u8; 16];
+        let matching = SaltInputs {
+            local_salt: &local,
+            local_epoch: 1,
+            remote_salt_b64: Some(&b64_encode(&local)),
+            remote_epoch: Some(99),
+            remote_key_change: Some(models::constants::KEY_CHANGE_RESET),
+            pending_marker: None,
+        };
+        assert_eq!(salt_action(&matching), SaltAction::Proceed);
+
+        let mut behind = matching;
+        let diverged = b64_encode(&[2u8; 16]);
+        behind.remote_salt_b64 = Some(&diverged);
+        behind.local_epoch = 5;
+        behind.remote_epoch = Some(4);
+        assert_eq!(salt_action(&behind), SaltAction::RemoteKeyChanged);
+    }
+
+    #[test]
+    fn a_pending_reset_marker_beats_the_rekey_marker_check() {
+        // This device has a stale rekey marker and the remote was reset after
+        // it. The reset must win, or we would push our stale salt over the wipe.
+        let local = [1u8; 16];
+        let i = SaltInputs {
+            local_salt: &local,
+            local_epoch: 1,
+            remote_salt_b64: Some(&b64_encode(&[2u8; 16])),
+            remote_epoch: Some(3),
+            remote_key_change: Some(models::constants::KEY_CHANGE_RESET),
+            pending_marker: Some(&hex::encode(local)),
+        };
+        assert_eq!(salt_action(&i), SaltAction::RemoteReset);
     }
 
     #[test]
