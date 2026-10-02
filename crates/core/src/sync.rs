@@ -105,6 +105,8 @@ impl fmt::Debug for StoredSession {
 /// Keyring entry for the account's Supabase session. Account-global on purpose
 /// (see [`KEYRING_ACCOUNT_SUPABASE`]), so it takes no database.
 fn supabase_entry() -> Result<Entry, CoreError> {
+    #[cfg(test)]
+    keyring_probe::record();
     Entry::new(models::constants::KEYRING_SERVICE, KEYRING_ACCOUNT_SUPABASE).map_err(|e| {
         CoreError::Other(format!(
             "OS keyring unavailable ({e}); sync requires it to store the Supabase session"
@@ -112,9 +114,58 @@ fn supabase_entry() -> Result<Entry, CoreError> {
     })
 }
 
+/// Test-only count of keyring requests made by this thread. The override tests
+/// need to prove the keyring was skipped *without* touching the real one, and
+/// "the session round-tripped" cannot show that: a run that consulted the
+/// keyring and overwrote the account session would still look like a pass.
+#[cfg(test)]
+mod keyring_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static KEYRING_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn calls() -> usize {
+        KEYRING_CALLS.with(Cell::get)
+    }
+
+    pub fn record() {
+        KEYRING_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn keyring_calls() -> usize {
+    keyring_probe::calls()
+}
+
+/// `VLTR_SYNC_SESSION_FILE` override, or `None` when it is unset, empty or
+/// whitespace-only — same rule and same reason as
+/// [`crate::session::session_file_override`]: `export VLTR_SYNC_SESSION_FILE=`
+/// is an accident, not a path, and honoring it would write the account session
+/// to the current directory.
+///
+/// Unlike `VLTR_SESSION_FILE` this one also *disables the keyring* (see
+/// [`KEYRING_ACCOUNT_SUPABASE`]): that account entry is global and shared by
+/// every vault, so a test run cannot use it without overwriting the user's real
+/// login. It exists so tests — and machines with no usable keyring — can run the
+/// sync paths against a file they own.
+fn sync_session_file_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("VLTR_SYNC_SESSION_FILE")?;
+    if raw.to_str().is_some_and(|raw| raw.trim().is_empty()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
 /// Fallback file for the account's Supabase session. Fixed name, same reason as
 /// the keyring account: one login for the account, shared by every vault.
+/// Overridable via `VLTR_SYNC_SESSION_FILE`, which replaces the whole path.
 fn supabase_session_file() -> Result<std::path::PathBuf, CoreError> {
+    if let Some(path) = sync_session_file_override() {
+        return Ok(path);
+    }
     let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")
         .map(|d| d.data_dir().to_path_buf())
         .ok_or_else(|| CoreError::Other("cannot determine Vaultr data directory".into()))?;
@@ -159,6 +210,11 @@ fn save_supabase_session(session: &Session) -> Result<(), CoreError> {
     // Keyring primero (con verificación de lectura); archivo 0600 como
     // fallback (mismo patrón que la master key).
     let json = serde_json::to_string(&stored).map_err(|e| CoreError::Other(e.to_string()))?;
+    // Override: el keyring no se toca en absoluto (ver
+    // `sync_session_file_override`).
+    if sync_session_file_override().is_some() {
+        return save_supabase_file(&stored);
+    }
     if let Ok(entry) = supabase_entry() {
         if entry.set_password(&json).is_ok()
             && entry.get_password().map(|r| r == json).unwrap_or(false)
@@ -172,6 +228,9 @@ fn save_supabase_session(session: &Session) -> Result<(), CoreError> {
 
 /// Load the account's stored Supabase session.
 fn load_stored_session() -> Result<Option<StoredSession>, CoreError> {
+    if sync_session_file_override().is_some() {
+        return load_supabase_file();
+    }
     if let Ok(entry) = supabase_entry() {
         match entry.get_password() {
             Ok(raw) => {
@@ -192,6 +251,12 @@ fn load_stored_session() -> Result<Option<StoredSession>, CoreError> {
 /// Log the account out of sync everywhere. Not per-vault on purpose
 /// ([`KEYRING_ACCOUNT_SUPABASE`]).
 fn clear_supabase_session() -> Result<(), CoreError> {
+    // Override: se borra el archivo y el keyring no se toca. Sin override esto
+    // no borra el archivo de fallback, igual que antes.
+    if let Some(path) = sync_session_file_override() {
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    }
     let entry = supabase_entry()?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -1320,5 +1385,123 @@ mod tests {
         assert!(!text.contains("SUPER-SECRET-ACCESS"));
         assert!(!text.contains("super-secret-refresh"));
         assert!(text.contains("StoredSession"));
+    }
+
+    /// `VLTR_SYNC_SESSION_FILE` is process-global: the tests that read or write
+    /// it must not run concurrently with each other.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sample_session() -> Session {
+        Session {
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
+            expires_in: 3600,
+            user_id: "user-1".into(),
+        }
+    }
+
+    #[test]
+    fn sync_session_override_roundtrips_through_the_file_only() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync-session.json");
+        std::env::set_var("VLTR_SYNC_SESSION_FILE", &path);
+
+        // Control: the keyring probe must actually see a request, or the
+        // assertion at the end of this test would pass vacuously.
+        // `Entry::new` only builds the entry, it never reaches the backend.
+        let before = keyring_calls();
+        let _ = supabase_entry();
+        assert_eq!(
+            keyring_calls(),
+            before + 1,
+            "probe must observe a keyring request"
+        );
+
+        save_supabase_session(&sample_session()).unwrap();
+        assert!(path.exists(), "override must be the file that gets written");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "session file must be 0600");
+        }
+
+        let loaded = load_stored_session()
+            .unwrap()
+            .expect("override file must be read back");
+        assert_eq!(loaded.access_token, "access-token");
+        assert_eq!(loaded.refresh_token, "refresh-token");
+        assert_eq!(loaded.user_id, "user-1");
+        assert_eq!(loaded.expires_in, 3600);
+
+        clear_supabase_session().unwrap();
+        assert!(!path.exists(), "clear must remove the override file");
+        assert!(load_stored_session().unwrap().is_none());
+
+        // The load-bearing assertion: none of the above asked for the keyring.
+        assert_eq!(
+            keyring_calls(),
+            before + 1,
+            "the override must bypass the keyring entirely"
+        );
+
+        std::env::remove_var("VLTR_SYNC_SESSION_FILE");
+    }
+
+    #[test]
+    fn sync_session_override_missing_file_is_not_logged_in() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("VLTR_SYNC_SESSION_FILE", dir.path().join("absent.json"));
+
+        let before = keyring_calls();
+        assert!(load_stored_session().unwrap().is_none());
+        // `clear` with no file is a no-op, not an error (matches `vltr logout`
+        // being idempotent).
+        clear_supabase_session().unwrap();
+        assert_eq!(keyring_calls(), before);
+
+        std::env::remove_var("VLTR_SYNC_SESSION_FILE");
+    }
+
+    #[test]
+    fn blank_sync_session_override_falls_back_to_the_default_file() {
+        let _guard = env_lock();
+        std::env::remove_var("VLTR_SYNC_SESSION_FILE");
+        assert!(
+            sync_session_file_override().is_none(),
+            "unset must not be an override"
+        );
+        let default = supabase_session_file().unwrap();
+
+        std::env::set_var("VLTR_SYNC_SESSION_FILE", "");
+        assert!(
+            sync_session_file_override().is_none(),
+            "empty is not a path"
+        );
+        assert_eq!(
+            supabase_session_file().unwrap(),
+            default,
+            "empty must fall back"
+        );
+
+        std::env::set_var("VLTR_SYNC_SESSION_FILE", "   ");
+        assert_eq!(
+            supabase_session_file().unwrap(),
+            default,
+            "whitespace must fall back"
+        );
+
+        assert!(
+            default.ends_with("sync-session.json"),
+            "default path must not change, got {default:?}"
+        );
+
+        std::env::remove_var("VLTR_SYNC_SESSION_FILE");
     }
 }
