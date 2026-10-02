@@ -650,22 +650,19 @@ fn main() -> Result<()> {
                     );
                     let password = prompt_password("New master password: ")?;
                     block_on(app.adopt_remote_key(password))?;
-                    // Salts match after a successful adopt, so this re-run
-                    // cannot loop on the same abort — surface it if it happens.
-                    match block_on(app.sync()) {
-                        Ok(report) => println!("Sincronización completada: {report}"),
-                        Err(vltr_core::CoreError::RemoteKeyChanged) => {
-                            bail!("El vault remoto cambió de nuevo; vuelve a intentarlo.")
-                        }
-                        Err(e) => bail!("Sin conexión con Supabase: {e}"),
-                    }
+                    // Same retry-once as the divergence prompt below, and for
+                    // the same reason: salts match after a successful adopt, so
+                    // this re-run cannot loop on the same abort — but a reset
+                    // can land in between, and that deserves its own message
+                    // rather than "Sin conexión con Supabase".
+                    retry_sync_after_divergence(&mut app)?;
                 }
                 Err(vltr_core::CoreError::RemoteReset(info)) => {
                     eprintln!(
                         "El vault remoto se reseteó en otro dispositivo \
                          (key_epoch {}, key_change {}).",
                         info.remote_epoch,
-                        info.key_change.as_deref().unwrap_or("desconocido"),
+                        key_change_label(info.key_change.as_deref()),
                     );
                     if let Some(when) = info.key_changed_at {
                         eprintln!("El cambio de clave se registró el {when}.");
@@ -762,12 +759,17 @@ fn prompt_line_verbatim(prompt: &str) -> Result<String> {
     Ok(line.to_owned())
 }
 
-/// Re-run the sync after the divergence prompt resolved the divergence.
+/// Re-run the sync once a divergence was resolved — by the guided adoption
+/// after a `RemoteKeyChanged`, or by the three-way prompt after a
+/// `RemoteReset`.
 ///
-/// Same retry-once shape as the `RemoteKeyChanged` arm, with one addition: a
-/// retry can abort with `RemoteReset` too (another device reset again in
-/// between), and reporting that as a connection failure would be a lie, so it
-/// gets its own message.
+/// One retry, never a loop: the step before it aligned this vault with the
+/// remote, so a second abort is a new event and is surfaced instead of retried.
+/// Both aborts need naming, not the catch-all: a reset landing between an
+/// adopt and its retry used to be reported as `Sin conexión con Supabase: the
+/// remote vault was reset on another device`, which is a connection failure
+/// wrapped around a state change — and hides a real condition behind a
+/// misleading one.
 fn retry_sync_after_divergence(app: &mut App) -> Result<()> {
     match block_on(app.sync()) {
         Ok(report) => {
@@ -781,6 +783,24 @@ fn retry_sync_after_divergence(app: &mut App) -> Result<()> {
             bail!("El vault remoto cambió de nuevo; vuelve a intentarlo.")
         }
         Err(e) => bail!("Sin conexión con Supabase: {e}"),
+    }
+}
+
+/// The `key_change` value to show next to the divergence menu, or
+/// `desconocido` for anything outside the vocabulary.
+///
+/// The server is untrusted — `vaults.key_change` is a free-text column — and
+/// this value is printed directly above the three options, so echoing it
+/// verbatim would let the server print a line that reads like a fourth one.
+/// Only the three known values are ever shown. The parser is exact-match
+/// either way, so the exposure was social rather than mechanical; this closes
+/// it.
+fn key_change_label(value: Option<&str>) -> &'static str {
+    match value {
+        Some(v) if v == models::constants::KEY_CHANGE_INIT => models::constants::KEY_CHANGE_INIT,
+        Some(v) if v == models::constants::KEY_CHANGE_REKEY => models::constants::KEY_CHANGE_REKEY,
+        Some(v) if v == models::constants::KEY_CHANGE_RESET => models::constants::KEY_CHANGE_RESET,
+        _ => "desconocido",
     }
 }
 
@@ -1123,6 +1143,36 @@ mod tests {
                 divergence_choice(input),
                 None,
                 "must re-prompt on {input:?}, not guess a choice"
+            );
+        }
+    }
+
+    #[test]
+    fn key_change_prints_only_the_three_known_values() {
+        // The server is untrusted: `vaults.key_change` is free text and it is
+        // printed right above the menu, so anything outside the vocabulary must
+        // never reach the terminal verbatim.
+        for known in [
+            models::constants::KEY_CHANGE_INIT,
+            models::constants::KEY_CHANGE_REKEY,
+            models::constants::KEY_CHANGE_RESET,
+        ] {
+            assert_eq!(key_change_label(Some(known)), known);
+        }
+        for hostile in [
+            Some(""),
+            Some("reset\n  d) keep local"),
+            Some("d"),
+            Some("keep"),
+            Some("RESET"),
+            Some("reset "),
+            Some("init; rekey"),
+            None,
+        ] {
+            assert_eq!(
+                key_change_label(hostile),
+                "desconocido",
+                "must not print {hostile:?} verbatim"
             );
         }
     }
