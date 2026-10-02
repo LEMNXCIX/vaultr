@@ -564,9 +564,6 @@ fn verify_key_against_sample(key: &MasterKey, sample: &[VariableRow]) -> Result<
 /// Mark a remote project as deleted for a reset. Pure; unit-testable.
 /// Only metadata changes: a reset has no master key, so the row's contents
 /// are carried through untouched.
-//
-// Not yet wired: the reset orchestrator (follow-up task) is the caller.
-#[allow(dead_code)]
 fn tombstone_project(row: &ProjectRow, now: DateTime<Utc>) -> ProjectRow {
     ProjectRow {
         deleted: true,
@@ -580,9 +577,6 @@ fn tombstone_project(row: &ProjectRow, now: DateTime<Utc>) -> ProjectRow {
 /// Only metadata changes (`EnvironmentRow` carries no `version` and none is
 /// added here): a reset has no master key, so the row is carried through
 /// untouched apart from the tombstone markers.
-//
-// Not yet wired: the reset orchestrator (follow-up task) is the caller.
-#[allow(dead_code)]
 fn tombstone_environment(row: &EnvironmentRow, now: DateTime<Utc>) -> EnvironmentRow {
     EnvironmentRow {
         deleted: true,
@@ -595,9 +589,6 @@ fn tombstone_environment(row: &EnvironmentRow, now: DateTime<Utc>) -> Environmen
 /// are carried through byte-identical: a reset has no master key, so
 /// re-encrypting is impossible, and a row whose ciphertext changed would no
 /// longer be readable by any device that still holds the old key.
-//
-// Not yet wired: the reset orchestrator (follow-up task) is the caller.
-#[allow(dead_code)]
 fn tombstone_variable(row: &VariableRow, now: DateTime<Utc>) -> VariableRow {
     VariableRow {
         deleted: true,
@@ -605,6 +596,27 @@ fn tombstone_variable(row: &VariableRow, now: DateTime<Utc>) -> VariableRow {
         updated_at: Some(now),
         ..row.clone()
     }
+}
+
+/// Tombstone every pulled row, grouped so the caller can push parents before
+/// children. Pure and order-preserving; the caller does the network.
+fn reset_tombstone_sets(
+    projects: &[ProjectRow],
+    environments: &[EnvironmentRow],
+    variables: &[VariableRow],
+    now: DateTime<Utc>,
+) -> (Vec<ProjectRow>, Vec<EnvironmentRow>, Vec<VariableRow>) {
+    (
+        projects.iter().map(|r| tombstone_project(r, now)).collect(),
+        environments
+            .iter()
+            .map(|r| tombstone_environment(r, now))
+            .collect(),
+        variables
+            .iter()
+            .map(|r| tombstone_variable(r, now))
+            .collect(),
+    )
 }
 
 /// Verify a derived key against the remote vault. Prefers the verifier
@@ -777,6 +789,81 @@ impl App {
         Ok(())
     }
 
+    /// Push the remote half of a reset: new vault metadata first, then a
+    /// tombstone for every row. Needs no master key — a tombstone is a
+    /// metadata write and the ciphertext travels through untouched.
+    ///
+    /// Idempotent: re-running re-tombstones already-dead rows, bumping their
+    /// version and `updated_at`, which the LWW merge resolves the same way.
+    /// Returns the number of rows tombstoned.
+    async fn push_reset(
+        &self,
+        client: &SyncClient,
+        session: &Session,
+        _remote: &sync::VaultRow,
+    ) -> Result<usize, CoreError> {
+        let meta = self.storage.get_vault_meta()?;
+        client
+            .push_vault(
+                session,
+                &VaultMetaPush {
+                    salt: b64_encode(&meta.salt),
+                    kdf_params: serde_json::to_value(&meta.kdf_params)?,
+                    verifier_ct: Some(b64_encode(&meta.verifier_ct)),
+                    verifier_nonce: Some(b64_encode(&meta.verifier_nonce)),
+                    key_epoch: meta.key_epoch,
+                    key_change: models::constants::KEY_CHANGE_RESET.into(),
+                    key_changed_at: Some(Utc::now().to_rfc3339()),
+                },
+            )
+            .await?;
+
+        let projects = client
+            .pull_rows::<ProjectRow>(session, "projects", None)
+            .await?;
+        let environments = client
+            .pull_rows::<EnvironmentRow>(session, "environments", None)
+            .await?;
+        let variables = client
+            .pull_rows::<VariableRow>(session, "variables", None)
+            .await?;
+        let (projects, environments, variables) =
+            reset_tombstone_sets(&projects, &environments, &variables, Utc::now());
+        let count = projects.len() + environments.len() + variables.len();
+
+        // Parents before children: the server enforces the same FKs.
+        if !projects.is_empty() {
+            client.push_rows(session, "projects", &projects).await?;
+        }
+        if !environments.is_empty() {
+            client
+                .push_rows(session, "environments", &environments)
+                .await?;
+        }
+        if !variables.is_empty() {
+            client.push_rows(session, "variables", &variables).await?;
+        }
+        Ok(count)
+    }
+
+    /// Wipe the remote of live secrets and align it with the local vault that
+    /// [`App::reset_local`] just installed. Requires a sync session; does not
+    /// require the master key.
+    pub async fn reset_remote(&mut self) -> Result<usize, CoreError> {
+        if !self.storage.is_initialized()? {
+            return Err(CoreError::Other("vault not initialized".into()));
+        }
+        let client = sync_client()?;
+        let session = fresh_session(&client).await?;
+        let remote = client
+            .get_vault(&session)
+            .await?
+            .ok_or_else(|| CoreError::Other("no vault found on the server".into()))?;
+        let count = self.push_reset(&client, &session, &remote).await?;
+        SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
+        Ok(count)
+    }
+
     /// Two-way sync: salt guard → cascade → push dirty → pull since cursor →
     /// LWW merge → cascade → persist cursor. Moves ciphertext only.
     pub async fn sync(&self) -> Result<SyncReport, CoreError> {
@@ -789,6 +876,16 @@ impl App {
         // this vault was initialized independently); merging rows across them
         // would corrupt decryption on every device.
         let remote_vault = client.get_vault(&session).await?;
+        // A reset that was interrupted before its remote wipe landed must be
+        // finished first. Left to the salt guard it would abort with
+        // RemoteKeyChanged forever, since the local salt has already moved.
+        if self.pending_reset()? {
+            if let Some(remote) = remote_vault.as_ref() {
+                let count = self.push_reset(&client, &session, remote).await?;
+                report.pushed += count + 1;
+                SyncState::remove(self.storage.conn(), PENDING_LOCAL_RESET_KEY)?;
+            }
+        }
         let mut vault_push: Option<VaultMetaPush> = None;
         let mut clear_rekey_marker = false;
         let mut salt_action_taken = SaltAction::Proceed;
@@ -1292,6 +1389,69 @@ mod tests {
         assert_eq!(dead_env.is_default, env.is_default);
         assert_eq!(dead_env.sort_order, env.sort_order);
         assert_eq!(dead_env.owner_id, env.owner_id);
+    }
+
+    fn sample_project_row() -> ProjectRow {
+        ProjectRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000010".into(),
+            name: "P".into(),
+            description: None,
+            color: None,
+            icon: None,
+            deleted: false,
+            version: 1,
+            updated_at: None,
+        }
+    }
+
+    fn sample_environment_row() -> EnvironmentRow {
+        EnvironmentRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000011".into(),
+            project_id: "018f0000-0000-7000-8000-000000000010".into(),
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            deleted: false,
+            updated_at: None,
+        }
+    }
+
+    fn sample_variable_row() -> VariableRow {
+        VariableRow {
+            owner_id: Some("u".into()),
+            id: "018f0000-0000-7000-8000-000000000012".into(),
+            environment_id: "018f0000-0000-7000-8000-000000000011".into(),
+            key: "K".into(),
+            value_encrypted: b64_encode(b"opaque-ciphertext"),
+            nonce: b64_encode(b"opaque-nonce-24-bytes-xx"),
+            notes: None,
+            is_readonly: false,
+            allow_export: true,
+            deleted: false,
+            version: 1,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn reset_tombstones_every_table_and_preserves_parent_order() {
+        let now = ts(0);
+        let (projects, environments, variables) = reset_tombstone_sets(
+            &[sample_project_row()],
+            &[sample_environment_row()],
+            &[sample_variable_row()],
+            now,
+        );
+        assert_eq!(projects.len(), 1);
+        assert_eq!(environments.len(), 1);
+        assert_eq!(variables.len(), 1);
+        assert!(projects[0].deleted && environments[0].deleted && variables[0].deleted);
+        assert_eq!(
+            variables[0].value_encrypted,
+            b64_encode(b"opaque-ciphertext")
+        );
     }
 
     fn salt_inputs<'a>(
