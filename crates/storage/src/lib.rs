@@ -795,9 +795,20 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+/// `SECRETS_DB` override, or `None` when it is unset, empty or whitespace-only.
+///
+/// An empty value is not a path: `export SECRETS_DB=` in a `.env` or a shell
+/// profile is a common accident, and honoring it would open a throwaway empty
+/// database instead of the real vault. Blank therefore means "not set" and the
+/// default path wins. A non-blank value is used verbatim.
+fn db_env_override() -> Option<PathBuf> {
+    let raw = std::env::var("SECRETS_DB").ok()?;
+    (!raw.trim().is_empty()).then(|| PathBuf::from(raw))
+}
+
 pub fn default_db_path() -> PathBuf {
-    if let Ok(path) = std::env::var("SECRETS_DB") {
-        return PathBuf::from(path);
+    if let Some(path) = db_env_override() {
+        return path;
     }
     use models::constants::{APP_NAME, APP_ORGANIZATION, APP_QUALIFIER};
     let base = directories::ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
@@ -890,6 +901,56 @@ mod tests {
         std::fs::write(&legacy, b"legacy").unwrap();
         assert!(!migrate_vault_path(&legacy, &target).unwrap());
         assert_eq!(std::fs::read(&target).unwrap(), b"vault");
+    }
+
+    /// `SECRETS_DB` is process-global: the tests that read or write it must not
+    /// run concurrently with each other.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn unset_db_env_var_falls_back_to_the_data_dir() {
+        let _guard = env_lock();
+        std::env::remove_var("SECRETS_DB");
+
+        let path = default_db_path();
+
+        assert_eq!(path.file_name().unwrap(), "vault.db");
+        assert!(
+            path.parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty()),
+            "the default vault must live in the project data dir, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn blank_db_env_var_is_treated_as_unset() {
+        let _guard = env_lock();
+        std::env::remove_var("SECRETS_DB");
+        let default = default_db_path();
+
+        // `export SECRETS_DB=` in a .env is a common accident. Honoring it would
+        // silently open a throwaway database instead of the real vault.
+        std::env::set_var("SECRETS_DB", "");
+        assert_eq!(default_db_path(), default, "empty must fall back");
+
+        std::env::set_var("SECRETS_DB", "   ");
+        assert_eq!(default_db_path(), default, "whitespace must fall back");
+
+        std::env::remove_var("SECRETS_DB");
+    }
+
+    #[test]
+    fn db_env_var_overrides_the_path_when_set() {
+        let _guard = env_lock();
+        let path = PathBuf::from("/tmp/vaultr-env-override.db");
+        std::env::set_var("SECRETS_DB", &path);
+
+        assert_eq!(default_db_path(), path);
+
+        std::env::remove_var("SECRETS_DB");
     }
 
     fn sample_var(env_id: Id, key: &str) -> Variable {

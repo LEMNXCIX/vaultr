@@ -132,14 +132,30 @@ fn decode_key(key_hex: &str) -> Option<MasterKey> {
     Some(Zeroizing::new(arr))
 }
 
+/// `VLTR_SESSION_FILE` override, or `None` when it is unset, empty or
+/// whitespace-only.
+///
+/// An empty value is not a path: `export VLTR_SESSION_FILE=` in a `.env` or a
+/// shell profile is a common accident, and honoring it would point the session
+/// file at the current directory instead of the per-database fallback. Blank
+/// therefore means "not set". A non-blank value is used verbatim, including a
+/// non-UTF-8 path.
+fn session_file_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("VLTR_SESSION_FILE")?;
+    if raw.to_str().is_some_and(|raw| raw.trim().is_empty()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(raw))
+}
+
 /// Path of the fallback session file for one database. Overridable via
 /// `VLTR_SESSION_FILE` (tests and debugging), which replaces the whole path.
 ///
 /// Otherwise the name carries the per-database account: a fixed filename would
 /// make every vault share one session file.
 fn session_file_path(db_path: &Path) -> Result<std::path::PathBuf, CoreError> {
-    if let Some(path) = std::env::var_os("VLTR_SESSION_FILE") {
-        return Ok(std::path::PathBuf::from(path));
+    if let Some(path) = session_file_override() {
+        return Ok(path);
     }
     let dir = directories::ProjectDirs::from("dev", "Vaultr", "vaultr")
         .map(|d| d.data_dir().to_path_buf())
@@ -448,6 +464,32 @@ mod tests {
         save_memory_file(&db, &key).unwrap();
         stop_memory_file(&db).unwrap();
         assert!(!path.exists());
+
+        std::env::remove_var("VLTR_SESSION_FILE");
+    }
+
+    #[test]
+    fn blank_session_file_override_is_treated_as_unset() {
+        let _guard = env_lock();
+        let db = Path::new("/srv/one/vault.db");
+        std::env::remove_var("VLTR_SESSION_FILE");
+        let fallback = session_file_path(db).unwrap();
+
+        // `export VLTR_SESSION_FILE=` must not redirect the session file to
+        // the current directory.
+        std::env::set_var("VLTR_SESSION_FILE", "");
+        assert_eq!(
+            session_file_path(db).unwrap(),
+            fallback,
+            "empty must fall back"
+        );
+
+        std::env::set_var("VLTR_SESSION_FILE", "   ");
+        assert_eq!(
+            session_file_path(db).unwrap(),
+            fallback,
+            "whitespace must fall back"
+        );
 
         std::env::remove_var("VLTR_SESSION_FILE");
     }
