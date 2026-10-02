@@ -29,6 +29,11 @@ const CURSOR_KEY: &str = "last_pull";
 /// rotated. A salt mismatch with this marker present authorizes pushing the
 /// new local vault meta; without it the mismatch aborts the sync.
 pub const PENDING_REKEY_SALT_KEY: &str = "pending_rekey_salt";
+/// `sync_state` marker set by `reset_local`: this device has abandoned its key
+/// and installed a new domain locally, but the matching remote wipe may not
+/// have landed. A sync with this marker set finishes the wipe before running
+/// the salt guard.
+pub const PENDING_LOCAL_RESET_KEY: &str = "pending_local_reset";
 /// Refresh the access token this many seconds before it expires.
 const REFRESH_MARGIN_SECS: u64 = 60;
 

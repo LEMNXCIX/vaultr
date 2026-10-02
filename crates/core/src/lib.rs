@@ -203,6 +203,53 @@ impl App {
         Ok(count)
     }
 
+    /// Replace the local vault with an empty one under a NEW master key.
+    ///
+    /// Deliberately does not require an unlocked vault, and never reads
+    /// `require_key()`: the lost password is the reason this exists. The old
+    /// rows are deleted rather than re-encrypted because their key is gone.
+    ///
+    /// Records `pending_local_reset` so a later sync pushes the matching
+    /// remote wipe, and clears any `pending_rekey_salt` — a reset subsumes
+    /// both markers, and only one may be active at a time.
+    pub fn reset_local(
+        &mut self,
+        new_password: SecretString,
+        target_epoch: i64,
+    ) -> Result<(), CoreError> {
+        if !self.storage.is_initialized()? {
+            return Err(CoreError::Other("vault not initialized".into()));
+        }
+        let kdf_params = self.storage.get_vault_meta()?.kdf_params;
+        let salt = generate_salt();
+        let new_key = derive_master_key(&new_password, &salt, &kdf_params)?;
+        let (verifier_ct, verifier_nonce) =
+            encrypt(&new_key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+        self.storage.reset_vault(
+            &salt,
+            &kdf_params,
+            &verifier_ct,
+            &verifier_nonce,
+            target_epoch,
+        )?;
+        SyncState::remove(self.storage.conn(), sync::PENDING_REKEY_SALT_KEY)?;
+        SyncState::set(
+            self.storage.conn(),
+            sync::PENDING_LOCAL_RESET_KEY,
+            &target_epoch.to_string(),
+        )?;
+        self.last_session_error = session::save_master_key(&new_key)
+            .err()
+            .map(|e| e.to_string());
+        self.master_key = Some(new_key);
+        Ok(())
+    }
+
+    /// True when a local reset still needs its remote wipe pushed.
+    pub fn pending_reset(&self) -> Result<bool, CoreError> {
+        Ok(SyncState::get(self.storage.conn(), sync::PENDING_LOCAL_RESET_KEY)?.is_some())
+    }
+
     /// Unlock using a key already loaded (e.g. from OS keyring or a local session file).
     pub fn unlock_with_key(&mut self, key: MasterKey) -> Result<(), CoreError> {
         if !self.storage.is_initialized()? {
@@ -860,6 +907,63 @@ mod tests {
         app.unlock(SecretString::new("first".into())).unwrap();
         app.rekey(SecretString::new("second".into())).unwrap();
         assert_eq!(app.storage.get_vault_meta().unwrap().key_epoch, 2);
+    }
+
+    #[test]
+    fn reset_local_installs_an_empty_vault_under_a_new_key() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("old-password".into())).unwrap();
+        app.create_project("p", None, None, None).unwrap();
+        let env = app.default_environment("p").unwrap();
+        app.set_variable("p", &env.name, "K", "secret", None)
+            .unwrap();
+        let old_salt = app.storage.get_vault_meta().unwrap().salt;
+
+        // Note: locked, and no call supplying the old password anywhere.
+        // `reset_local` must work without an unlocked vault.
+        app.lock().unwrap();
+        app.reset_local(SecretString::new("brand-new".into()), 7)
+            .unwrap();
+
+        assert!(app.storage.list_projects().unwrap().is_empty());
+        assert!(app.storage.all_variables().unwrap().is_empty());
+        let meta = app.storage.get_vault_meta().unwrap();
+        assert_ne!(
+            meta.salt, old_salt,
+            "a reset must rotate the salt, never keep it"
+        );
+        assert_eq!(meta.key_epoch, 7);
+        assert!(!meta.verifier_ct.is_empty());
+
+        // The new password opens it; the old one does not.
+        assert!(app
+            .verify_password(SecretString::new("brand-new".into()))
+            .is_ok());
+        assert!(app
+            .verify_password(SecretString::new("old-password".into()))
+            .is_err());
+
+        assert!(app.pending_reset().unwrap());
+    }
+
+    #[test]
+    fn reset_local_clears_a_pending_rekey_marker() {
+        let mut app = App::open_in_memory().unwrap();
+        app.init(SecretString::new("first".into())).unwrap();
+        app.rekey(SecretString::new("second".into())).unwrap();
+        assert!(
+            SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY)
+                .unwrap()
+                .is_some()
+        );
+
+        app.lock().unwrap();
+        app.reset_local(SecretString::new("third".into()), 9)
+            .unwrap();
+        assert_eq!(
+            SyncState::get(app.storage.conn(), sync::PENDING_REKEY_SALT_KEY).unwrap(),
+            None
+        );
     }
 
     #[test]
