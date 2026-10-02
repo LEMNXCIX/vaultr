@@ -135,29 +135,81 @@ AGENTS.md             # Instrucciones para cualquier agente
 | [AGENTS.md](AGENTS.md) | Contrato principal para IAs |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Capas y cifrado |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Fases del MVP |
+| [docs/SYNC.md](docs/SYNC.md) | Sync con Supabase, guard de salt, conflictos |
+| [docs/SESSION.md](docs/SESSION.md) | Sesión con keyring y su fallback en disco |
+| [docs/MIGRATIONS.md](docs/MIGRATIONS.md) | Schema y migraciones SQL versionadas |
+| [docs/COMPLETIONS.md](docs/COMPLETIONS.md) | Autocompletado shell |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Estilo y PRs |
 | [docs/CI_CD.md](docs/CI_CD.md) | Flujo de hooks, CI y releases |
 | `.agents/skills/vaultr/` | Skill de desarrollo del proyecto |
 
-## CLI (MVP en progreso)
+## CLI
+
+```bash
+# 1. Vault y sesión (la master key vive en el keyring del SO)
+vltr init                  # crea el vault en la ruta por defecto
+vltr unlock                # abre el vault y guarda la sesión
+
+# 2. Proyecto y environments (el nombre sale del directorio actual)
+cd ~/work/mi-api
+vltr create                # proyecto "mi-api" + environment `local`
+vltr env development       # crea un environment extra
+vltr env                   # lista los environments del proyecto
+vltr use development       # cambia el environment por defecto
+
+# 3. Variables — sin -p se usa el proyecto del directorio actual,
+#    y sin -e el environment por defecto de ese proyecto
+vltr set DATABASE_URL postgres://localhost/mi_api
+vltr set STRIPE_KEY sk-... -e production
+vltr ls                    # lista enmascarando los valores
+vltr get STRIPE_KEY        # imprime el valor
+vltr get STRIPE_KEY --copy # además lo copia al portapapeles
+vltr search stripe         # busca claves en todo el vault
+vltr del STRIPE_KEY        # borra la variable
+```
+
+```bash
+# 4. .env de entrada y salida
+vltr import .env -e development
+vltr export -o /tmp/mi_api.env
+vltr apply                 # escribe/actualiza el .env del proyecto
+
+# 5. Backup cifrado y rotación de la master password
+vltr backup ~/backups/vaultr.bak
+vltr restore ~/backups/vaultr.bak
+vltr rekey                 # nueva contraseña; re-cifra el vault
+
+# 6. Estado
+vltr status --all          # proyectos y environments con su conteo
+vltr projects
+```
+
+Sync opcional con Supabase — solo viaja ciphertext, nunca la master key.
+Ver [docs/SYNC.md](docs/SYNC.md) para el setup y el modelo de conflictos.
+
+```bash
+vltr signup                # crea la cuenta remota
+vltr login                 # sesión (JWT + refresh) en el keyring
+vltr sync                  # sube y baja cambios
+vltr bootstrap             # otro dispositivo: parte del vault remoto
+vltr logout
+```
+
+Autocompletado:
 
 ```bash
 vltr completions zsh > ~/.zfunc/_vltr
+vltr completions install            # instala y actualiza el perfil del shell
 ```
 
+La variable de entorno `SECRETS_DB` sobreescribe la ruta por defecto del vault
+(`~/.local/share/vaultr/vault.db`). Debe tener un valor **no vacío**: si está
+vacía o solo contiene espacios se ignora y gana la ruta por defecto, para que un
+`export SECRETS_DB=` accidental no abra un vault vacío.
 
 ```bash
-vltr init
-cd Fudi
-vltr create
-vltr set OPENAI_API_KEY sk-...
-vltr get OPENAI_API_KEY --copy
-vltr export
-vltr ls
-vltr status
+export SECRETS_DB=~/.local/share/vaultr/otro-vault.db
 ```
-
-La variable de entorno `SECRETS_DB` sobreescribe la ruta por defecto de la base de datos del vault.
 
 ## Licencia
 
