@@ -99,7 +99,9 @@ solo pueden compartir cifrado si usan el **mismo salt**; por eso `vaults.salt`
 - **`vltr rekey`** cambia la master password: genera un salt nuevo,
   re-cifra todas las variables (conservando `updated_at` para no distorsionar
   LWW; se marcan dirty con `synced_at = NULL`), actualiza el verificador y
-  deja un marcador `pending_rekey_salt` en `sync_state`. El siguiente
+  deja un marcador `pending_rekey_salt` en `sync_state` — salvo que ya haya un
+  `pending_local_reset` pendiente, en cuyo caso el reset gana y no se escribe
+  marcador de rekey (ver *Reset* más abajo). El siguiente
   `vltr sync` sube el salt nuevo antes que las filas y limpia el marcador;
   los demás dispositivos ven el abort y pasan por la adopción guiada.
 - **Guard en `vltr init`:** si la cuenta ya tiene vault en el server, `init`
@@ -164,6 +166,16 @@ que se abre con la contraseña anterior a ese `rekey`.
   instalar este dispositivo chocaría contra el viejo del remoto y el sync
   abortaría para siempre. Si la cuenta no tiene fila en `vaults` es que no hay
   nada que borrar, y eso no se reporta como fallo.
+- **Los dos marcadores no pueden estar activos a la vez.** `reset_local` borra
+  cualquier `pending_rekey_salt`, y un `rekey` posterior **no** crea el suyo
+  mientras el reset siga pendiente: el borrado ya sube el salt local de todas
+  formas (`push_reset` publica el local, no el remoto), así que el marcador de
+  rekey no aportaría nada y solo convertiría el `key_change` publicado de
+  `reset` en `rekey`, sin borrar nada — dejando las filas previas al reset
+  vivas y legibles en el resto de dispositivos, que todavía tienen la clave
+  vieja, y a esos dispositivos en el prompt de `RemoteKeyChanged` en vez del
+  de divergencia. Si el `rekey` se interrumpe, el reset sigue pendiente y el
+  siguiente sync lo termina.
 
 ### Divergencia: el remoto se reseteó en otro dispositivo
 
