@@ -420,6 +420,14 @@ fn salt_action(i: &SaltInputs) -> SaltAction {
     SaltAction::RemoteKeyChanged
 }
 
+/// True when the remote vault shares our key domain but predates the verifier
+/// migration, so this sync should fill in the verifier. Deliberately only for
+/// `Proceed`: a salt mismatch must abort before anything is written.
+fn needs_verifier_backfill(action: SaltAction, remote: Option<&VaultRow>) -> bool {
+    matches!(action, SaltAction::Proceed)
+        && remote.is_some_and(|v| v.verifier_ct.is_none() && v.verifier_nonce.is_none())
+}
+
 // ---------- Merge (pure-ish: Storage in, rows applied) ----------
 
 /// Result of merging one pulled row.
@@ -773,6 +781,35 @@ impl App {
                 // a mismatch, and the next rekey overwrites it.
                 SyncState::remove(self.storage.conn(), PENDING_REKEY_SALT_KEY)?;
             }
+        }
+
+        // Backfill: this vault predates the verifier migration. Completing the
+        // verifier makes the next device's password check real. It never touches
+        // salt, kdf_params or key_epoch — only additive fields.
+        if needs_verifier_backfill(salt_action_taken, remote_vault.as_ref()) {
+            let meta = self.storage.get_vault_meta()?;
+            let key = self.require_key()?;
+            let (ct, nonce) = encrypt(key, models::constants::VAULT_VERIFIER_MESSAGE)?;
+            client
+                .push_vault(
+                    &session,
+                    &VaultMetaPush {
+                        salt: remote_vault
+                            .as_ref()
+                            .map(|v| v.salt.clone())
+                            .unwrap_or_default(),
+                        kdf_params: remote_vault
+                            .as_ref()
+                            .map(|v| v.kdf_params.clone())
+                            .unwrap_or_default(),
+                        verifier_ct: Some(b64_encode(&ct)),
+                        verifier_nonce: Some(b64_encode(&nonce)),
+                        key_epoch: meta.key_epoch,
+                        key_change: models::constants::KEY_CHANGE_INIT.into(),
+                        key_changed_at: None,
+                    },
+                )
+                .await?;
         }
 
         let projects = self.storage.dirty_projects()?;
@@ -1439,6 +1476,32 @@ mod tests {
             verifier_parts(&row),
             Err(CoreError::RemoteVerifierIncomplete)
         ));
+    }
+
+    #[test]
+    fn backfill_only_on_matching_domain_without_verifier() {
+        let key = test_keys().0;
+        let mut old_row = vault_row_with_verifier(&key);
+        old_row.verifier_ct = None;
+        old_row.verifier_nonce = None;
+
+        assert!(needs_verifier_backfill(SaltAction::Proceed, Some(&old_row)));
+        assert!(
+            !needs_verifier_backfill(SaltAction::Proceed, None),
+            "no remote vault: the first push already carries the verifier"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::RemoteKeyChanged, Some(&old_row)),
+            "a salt mismatch must abort, never write"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::PushRekey, Some(&old_row)),
+            "a rekey push already carries a verifier"
+        );
+        assert!(
+            !needs_verifier_backfill(SaltAction::Proceed, Some(&vault_row_with_verifier(&key))),
+            "already has a verifier"
+        );
     }
 
     #[test]
