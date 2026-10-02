@@ -252,6 +252,51 @@ impl Storage {
         Ok(())
     }
 
+    /// Destroy every row and re-install a new key domain on the single
+    /// `vault_meta` row. Used by the reset flow, where the previous key is
+    /// unrecoverable and its rows cannot be re-encrypted — only deleted.
+    ///
+    /// `sync_state` is emptied too: the cursor describes rows this vault no
+    /// longer has, so carrying it over would silently skip a pull.
+    pub fn reset_vault(
+        &self,
+        salt: &[u8],
+        kdf_params: &KdfParams,
+        verifier_ct: &[u8],
+        verifier_nonce: &[u8],
+        key_epoch: i64,
+    ) -> Result<(), StorageError> {
+        if !self.is_initialized()? {
+            return Err(StorageError::NotInitialized);
+        }
+        let params_json = serde_json::to_string(kdf_params)?;
+        let tx = self.conn.unchecked_transaction()?;
+        // Children first: variables → environments → projects hold FKs.
+        tx.execute("DELETE FROM variables", [])?;
+        tx.execute("DELETE FROM environments", [])?;
+        tx.execute("DELETE FROM projects", [])?;
+        tx.execute("DELETE FROM sync_state", [])?;
+        let n = tx.execute(
+            "UPDATE vault_meta
+             SET salt = ?1, kdf_params = ?2, verifier_ct = ?3, verifier_nonce = ?4,
+                 key_epoch = ?5, updated_at = ?6
+             WHERE id = 1",
+            params![
+                salt,
+                params_json,
+                verifier_ct,
+                verifier_nonce,
+                key_epoch,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if n == 0 {
+            return Err(StorageError::NotInitialized);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---------- Projects ----------
 
     pub fn create_project(&self, project: &Project) -> Result<(), StorageError> {
@@ -1113,6 +1158,77 @@ mod tests {
         let s = Storage::open_in_memory().unwrap();
         assert!(matches!(
             s.set_key_epoch(2),
+            Err(StorageError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn reset_vault_empties_everything_and_installs_the_new_domain() {
+        let s = Storage::open_in_memory().unwrap();
+        s.init_vault(&[1u8; 16], &KdfParams::default(), b"ct", b"nonce")
+            .unwrap();
+        let now = Utc::now();
+        let p = Project {
+            id: Uuid::now_v7(),
+            name: "p".into(),
+            description: None,
+            color: None,
+            icon: None,
+            created_at: now,
+            updated_at: now,
+            owner_id: None,
+            version: 1,
+            deleted: false,
+        };
+        s.create_project(&p).unwrap();
+        let e = Environment {
+            id: Uuid::now_v7(),
+            project_id: p.id,
+            name: "local".into(),
+            is_default: true,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        s.create_environment(&e).unwrap();
+        s.create_variable(&sample_var(e.id, "K")).unwrap();
+        SyncState::set(s.conn(), "last_pull", "2026-01-01T00:00:00Z").unwrap();
+        assert!(!s.all_variables().unwrap().is_empty());
+
+        let params = KdfParams {
+            m_cost: 2048,
+            t_cost: 1,
+            p_cost: 1,
+            output_len: 32,
+        };
+        s.reset_vault(&[9u8; 16], &params, b"new-ct", b"new-nonce", 4)
+            .unwrap();
+
+        assert!(
+            s.is_initialized().unwrap(),
+            "the vault still exists after a reset"
+        );
+        assert!(s.list_projects().unwrap().is_empty());
+        assert!(s.all_variables().unwrap().is_empty());
+        assert_eq!(
+            SyncState::get(s.conn(), "last_pull").unwrap(),
+            None,
+            "the pull cursor is dropped"
+        );
+        let meta = s.get_vault_meta().unwrap();
+        assert_eq!(meta.salt, vec![9u8; 16]);
+        assert_eq!(meta.kdf_params.m_cost, 2048);
+        assert_eq!(meta.verifier_ct, b"new-ct".to_vec());
+        assert_eq!(meta.verifier_nonce, b"new-nonce".to_vec());
+        assert_eq!(meta.key_epoch, 4);
+    }
+
+    #[test]
+    fn reset_vault_on_uninitialized_vault_errors() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(matches!(
+            s.reset_vault(&[9u8; 16], &KdfParams::default(), b"c", b"n", 1),
             Err(StorageError::NotInitialized)
         ));
     }
