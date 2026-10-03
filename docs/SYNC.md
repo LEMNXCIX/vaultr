@@ -94,8 +94,10 @@ solo pueden compartir cifrado si usan el **mismo salt**; por eso `vaults.salt`
   del vault remoto, deriva la clave con el salt remoto, la verifica contra el
   verificador remoto si lo hay (o contra un ciphertext de muestra en vaults
   antiguos, el mismo truco que `bootstrap`), re-cifra todas las
-  variables locales con la nueva clave, reemplaza `vault_meta` local por el
-  remoto y continúa con el sync normal. El pull cursor no se toca.
+  variables locales con la nueva clave — y para eso necesita el vault local
+  desbloqueado, así que si no hay sesión vigente pide la master password
+  **local** —, reemplaza `vault_meta` local por el remoto y continúa con el
+  sync normal. El pull cursor no se toca.
 - **`vltr rekey`** cambia la master password: genera un salt nuevo,
   re-cifra todas las variables (conservando `updated_at` para no distorsionar
   LWW; se marcan dirty con `synced_at = NULL`), actualiza el verificador y
@@ -186,9 +188,11 @@ el cambio) y ofrece tres salidas. Es la pieza que evita la resurrección: la
 adopción automática subiría las filas previas al borrado por encima del borrado, y
 con ellas volverían al remoto secretos que el reset quiso destruir.
 
-El prompt llega después de que `vltr sync` ya haya desbloqueado el vault local
-con su contraseña, así que un dispositivo que perdió su propia clave no llega
-hasta aquí: para eso existe el reset.
+El prompt no pide la master password antes: `vltr sync` abre el vault **sin**
+desbloquearlo, porque no la necesita — nada de lo que hace un sync descifra, y el
+wipe de un reset pendiente son filas tombstone. Un dispositivo que perdió su
+propia clave sí llega hasta aquí, y por la opción a), que no necesita ninguna clave
+local. La opción b) sí la necesita, y entonces la pide, diciendo que la quiere.
 
 - **a) Descartar lo local** — se destruye este vault y se adopta el del remoto,
   que tras el reset está vacío: los dos dispositivos quedan alineados y vacíos.
@@ -303,7 +307,9 @@ Con tu propio proyecto Supabase:
     remoto) y cortar la red durante el siguiente `vltr sync`. Al restaurar la red,
     el `vltr sync` siguiente debe **terminar el borrado** (0 filas vivas), limpiar
     el marcador y sincronizar sin prompt de divergencia: el mismo sync que termina
-    el borrado es el que informa del éxito. Si no se corta a tiempo, el reset se
+    el borrado es el que informa del éxito. Y sin pedir la master password, que es
+    justo el caso para el que ese borrado pendiente importa: quien reseteó porque
+    la perdió ya no puede teclearla. Si no se corta a tiempo, el reset se
     habrá completado de sobra; repite el punto 11 con más filas en el remoto para
     tener una ventana más ancha.
 15. Segundo dispositivo: el prompt. Con A reseteado y B todavía sincronizado,

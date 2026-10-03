@@ -269,7 +269,18 @@ fn main() -> Result<()> {
             let initialized = app.is_initialized()?;
             let info = vltr_core::session::inspect(app.db_path()).ok().flatten();
             if info.is_some() {
-                let _ = app.try_unlock_from_session();
+                // `let _ =` here reported a session that cannot open this vault
+                // as a healthy one: `Session: active` next to `Unlocked: false`,
+                // with nothing to explain the contradiction. A session that
+                // cannot open its vault is discarded, so the next `status` would
+                // print `Session: none` — a third state for a vault that is
+                // perfectly fine. Say what happened instead of discarding it.
+                if let Err(e) = app.try_unlock_from_session() {
+                    eprintln!(
+                        "Note: the stored session could not be used to unlock this vault ({e}); \
+                         a session that cannot open its vault is discarded."
+                    );
+                }
             }
             match (&project, all) {
                 (None, false) => {
@@ -632,7 +643,7 @@ fn main() -> Result<()> {
         }
         Commands::Sync => {
             require_sync_config()?;
-            let app = App::open(&db_path)?;
+            let mut app = App::open(&db_path)?;
             if !app.is_initialized()? {
                 match block_on(App::remote_has_vault()) {
                     Ok(true) => bail!(
@@ -644,15 +655,26 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let mut app = open_and_unlock(&db_path)?;
+            // NO unlocking here, on purpose — see `restore_session_quietly` and
+            // `unlock_for_adoption` for why, and for the branch that does need
+            // the master password.
+            restore_session_quietly(&mut app);
             match block_on(app.sync()) {
                 Ok(report) => println!("Sincronización completada: {report}"),
                 Err(vltr_core::CoreError::RemoteKeyChanged) => {
                     eprintln!(
                         "La contraseña maestra del vault cambió en otro dispositivo (o este vault se inicializó de forma independiente); hace falta la contraseña del vault remoto para continuar."
                     );
-                    let password = prompt_password("New master password: ")?;
+                    unlock_for_adoption(&mut app)?;
+                    let password =
+                        prompt_password("REMOTE vault master password (the one that changed): ")?;
                     block_on(app.adopt_remote_key(password))?;
+                    // The adoption saved a session like every other key change,
+                    // and this was the one branch that never said whether it
+                    // landed. `RemoteKeyChanged` is the most frequent
+                    // divergence there is, which made the silent one the common
+                    // one.
+                    print_session_status(&mut app);
                     // Same retry-once as the divergence prompt below, and for
                     // the same reason: salts match after a successful adopt, so
                     // this re-run cannot loop on the same abort — but a reset
@@ -688,6 +710,10 @@ fn main() -> Result<()> {
                             print_session_status(&mut app);
                         }
                         DivergenceChoice::Keep => {
+                            // Same as `RemoteKeyChanged`: this choice re-encrypts
+                            // the local rows under the remote key, so it needs
+                            // them readable first.
+                            unlock_for_adoption(&mut app)?;
                             let password = prompt_password("Master password del vault remoto: ")?;
                             block_on(app.adopt_remote_key(password))?;
                             print_session_status(&mut app);
@@ -760,6 +786,71 @@ fn prompt_line_verbatim(prompt: &str) -> Result<String> {
     let line = line.strip_suffix('\n').unwrap_or(&line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     Ok(line.to_owned())
+}
+
+/// Use a stored session for a `vltr sync`, if there is one — and never fail
+/// because there isn't.
+///
+/// `App::sync()` reads the master key in exactly one place: the verifier
+/// backfill at `crates/core/src/sync/mod.rs:585`, reachable only when the salt
+/// guard answers `Proceed` AND the remote row carries no verifier — a shape no
+/// reset path can produce, since `push_reset` always publishes one. Everything
+/// else the sync does — finishing a pending wipe, the push, the pull, the merge,
+/// the cascade — moves ciphertext and metadata only. `crates/core/tests/
+/// reset_locked_sync.rs` pins both halves of that.
+///
+/// So the vault is opened WITHOUT unlocking. Gating on the password bought the
+/// user nothing and cost two things: `vltr sync` became unrunnable without a
+/// TTY (cron, CI, hooks, `docker exec`) even on the one command that finishes
+/// the wipe a lost password made necessary, and the prompt was a bare
+/// "Master password: " with no hint that it was optional or which of the two
+/// passwords the user was being asked for.
+///
+/// A stale session — the old key left behind by a `save_master_key` that
+/// failed — is dropped by `App::unlock_with_key` itself, and it is worth saying
+/// so out loud, because the alternative is `open_and_unlock`'s `?` turning it
+/// into "invalid master password" with no way forward: the password that works
+/// is the new one, which the message never mentions.
+///
+/// The error is reported, not propagated, and deliberately not claimed as a
+/// discard: `try_unlock_from_session` can also fail on an I/O error reading the
+/// session, which clears nothing.
+fn restore_session_quietly(app: &mut App) {
+    match app.try_unlock_from_session() {
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "The stored session could not be used to unlock this vault ({e}); a session that \
+             cannot open its vault is discarded. `vltr sync` does not need the master password, \
+             so it goes on without one — run `vltr unlock` if a command does."
+        ),
+    }
+}
+
+/// Ask for THIS vault's master password, and only if there is no key in memory.
+///
+/// The one branch of `vltr sync` that genuinely needs it: `adopt_remote_key`
+/// reads every local row to re-encrypt it under the remote key
+/// (`crates/core/src/sync/mod.rs:246`), so a locked vault has to be opened
+/// first. Its counterpart `discard_local_and_adopt` never reads `require_key()`
+/// — it destroys the local rows instead of re-encrypting them — so the
+/// "descartar lo local" choice asks for nothing but the remote's password, which
+/// is exactly the path the person who reset for a lost password needs.
+///
+/// The prompt names which vault it wants, because the remote's is asked for
+/// immediately after and the two are not interchangeable: after a `reset --local`
+/// the password in the user's head is the NEW local one, and typing it into the
+/// remote prompt verifies nothing while looking like it might.
+fn unlock_for_adoption(app: &mut App) -> Result<()> {
+    if app.is_unlocked() {
+        return Ok(());
+    }
+    let password = prompt_password(
+        "LOCAL vault master password (to decrypt its variables before re-encrypting them \
+         with the remote key): ",
+    )?;
+    app.unlock(password)?;
+    warn_if_session_unavailable(app);
+    Ok(())
 }
 
 /// Re-run the sync once a divergence was resolved — by the guided adoption
@@ -1041,12 +1132,47 @@ fn open_and_verify(db_path: &std::path::Path) -> Result<App> {
 }
 
 fn print_session_status(app: &mut App) {
-    match app.session_store().ok().flatten() {
-        Some(vltr_core::session::SessionStore::Keyring) => {}
+    let save_error = app.take_session_error();
+    let store = app.session_store().ok().flatten();
+    for line in session_status_lines(store, save_error.as_deref()) {
+        eprintln!("{line}");
+    }
+}
+
+/// What `print_session_status` has to say about the session, given the store
+/// that answered and the error left pending by a failed `save_master_key`.
+///
+/// Split out so the decision is testable without a TTY: which words get printed
+/// is the whole content of `print_session_status`, and the bug it now rules out
+/// was a branch that returned before the error was ever read.
+///
+/// The pending error is consulted FIRST, and it does not matter which store
+/// answered. `save_master_key` can fail while the PREVIOUS entry is still in
+/// place — a keyring that refuses the write, a full data dir — and then
+/// `session_store()` answers `Some(..)`, which is the state where a stale key
+/// can be hiding. Consulting the error only from the `None` arm is backwards:
+/// `None` means there is no session at all, so there is no stale key to explain.
+fn session_status_lines(
+    store: Option<vltr_core::session::SessionStore>,
+    save_error: Option<&str>,
+) -> Vec<String> {
+    if let Some(reason) = save_error {
+        return vec![format!(
+            "Warning: the new master key could not be saved to the session store ({reason}); \
+             the previous session may be stale, so commands will fail until you run \
+             `vltr unlock`."
+        )];
+    }
+    match store {
+        Some(vltr_core::session::SessionStore::Keyring) => Vec::new(),
         Some(vltr_core::session::SessionStore::Memory) => {
-            eprintln!("OS keyring is unavailable; using a local session file instead.");
+            vec!["OS keyring is unavailable; using a local session file instead.".into()]
         }
-        None => warn_if_session_unavailable(app),
+        None => vec![
+            "Warning: no session store is available; the password will be requested for \
+             future commands."
+                .into(),
+        ],
     }
 }
 
@@ -1218,5 +1344,76 @@ mod tests {
             "http error: status 500".into()
         )));
         assert!(!no_remote_vault(&vltr_core::CoreError::RemoteKeyChanged));
+    }
+
+    /// A failed `save_master_key` must be reported **whatever** store answered.
+    ///
+    /// The case that matters is the one where the store answers at all:
+    /// `save_master_key` fails writing the NEW key while the PREVIOUS entry is
+    /// still in place — the keyring refusing a write, the data dir full — so
+    /// `session_store()` returns `Some(..)` and the pending error used to be
+    /// dropped on the floor by the arm that returns without reading it.
+    ///
+    /// The result is the worst possible one and it is silent by construction:
+    /// the vault is encrypted under the new key, the stored session still holds
+    /// the old one, so `vltr status` reports unlocked and every other command
+    /// answers "invalid master password" for the rest of the session's TTL.
+    ///
+    /// This also pins the wording, because "no session store could be saved" is
+    /// the wrong diagnosis for that state: something WAS saved, just not the
+    /// key that is now in use.
+    #[test]
+    fn a_failed_session_save_is_reported_whatever_store_answered() {
+        use vltr_core::session::SessionStore;
+        let reason = "keyring: no such interface";
+
+        for store in [
+            Some(SessionStore::Keyring),
+            Some(SessionStore::Memory),
+            None,
+        ] {
+            let lines = session_status_lines(store, Some(reason));
+            assert_eq!(
+                lines.len(),
+                1,
+                "{store:?}: a failed save must produce exactly one warning, got {lines:?}"
+            );
+            assert!(
+                lines[0].contains(reason),
+                "{store:?}: the failure itself must be shown, got {lines:?}"
+            );
+            assert!(
+                lines[0].contains("vltr unlock"),
+                "{store:?}: the only recovery has to be named, got {lines:?}"
+            );
+            assert!(
+                !lines[0].contains("no session store could be saved"),
+                "{store:?}: a store DID answer — that wording blames the wrong thing, \
+                 got {lines:?}"
+            );
+        }
+    }
+
+    /// The counterpart, so the fix above cannot pass by muting everything: a
+    /// save that worked still reports the store it landed in, exactly as before.
+    #[test]
+    fn a_successful_session_save_still_reports_the_store() {
+        use vltr_core::session::SessionStore;
+
+        assert!(
+            session_status_lines(Some(SessionStore::Keyring), None).is_empty(),
+            "the keyring needs no comment"
+        );
+        assert_eq!(
+            session_status_lines(Some(SessionStore::Memory), None),
+            vec!["OS keyring is unavailable; using a local session file instead."],
+        );
+        assert_eq!(
+            session_status_lines(None, None),
+            vec![
+                "Warning: no session store is available; the password will be requested for \
+                 future commands."
+            ],
+        );
     }
 }
