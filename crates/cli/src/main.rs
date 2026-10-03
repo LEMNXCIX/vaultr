@@ -239,21 +239,13 @@ fn main() -> Result<()> {
             }
             let password = prompt_password("Master password: ")?;
             app.unlock(password)?;
-            match app.session_store()? {
-                Some(vltr_core::session::SessionStore::Keyring) => {
-                    println!("Vault unlocked (session saved in OS keyring).");
-                }
-                Some(vltr_core::session::SessionStore::Memory) => {
-                    println!("Vault unlocked (OS keyring unavailable; local session file in use).");
-                }
-                None => match app.take_session_error() {
-                    Some(reason) => {
-                        eprintln!("Vault unlocked, but no session could be saved ({reason}); the password will be requested for future commands.");
-                    }
-                    None => {
-                        eprintln!("Vault unlocked, but no session could be started; the password will be requested for future commands.");
-                    }
-                },
+            // Taken before the store is asked, and taken unconditionally: the
+            // error is consumed on read, so asking the store first would decide
+            // by accident whether anybody gets to hear about a failed save.
+            let save_error = app.take_session_error();
+            let store = app.session_store()?;
+            for line in unlock_lines(store, save_error.as_deref()) {
+                line.emit();
             }
         }
         Commands::Lock => {
@@ -1176,6 +1168,88 @@ fn session_status_lines(
     }
 }
 
+/// One line `unlock` has to print, carrying the stream it belongs to.
+///
+/// `unlock` confirmed a healthy store on stdout and warned on stderr, and that
+/// split is part of its decision: a user piping `vltr unlock` should get only
+/// the confirmation, and the warning must not be mistaken for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+impl SessionLine {
+    fn emit(&self) {
+        match self {
+            Self::Stdout(text) => println!("{text}"),
+            Self::Stderr(text) => eprintln!("{text}"),
+        }
+    }
+}
+
+/// What `unlock` has to say, given the store that answered and the error left
+/// pending by a failed `save_master_key`.
+///
+/// The pending error is consulted FIRST, and it does not matter which store
+/// answered. `save_master_key` can fail while the PREVIOUS entry is still in
+/// place — a keyring that refuses the write, a full data dir — and then
+/// `session_store()` answers `Some(..)`, which is precisely the state where
+/// the entry it points at is STALE: the vault is encrypted under the new key
+/// and the store still holds the old one.
+///
+/// Reading the error only from the `None` arm has that backwards. `None` means
+/// nothing is stored, so nothing can be stale and there is nothing to warn
+/// about; the arm that answers is the one carrying the bad news. Printing the
+/// confirmation there did not merely omit a warning, it asserted something
+/// false — the user left the command believing a session existed that would
+/// open a vault it can no longer open.
+///
+/// Not reused from `session_status_lines`: its lines are standalone warnings
+/// with no "Vault unlocked" confirmation, and the two healthy outcomes this
+/// command has to preserve are sentences of their own — taking its output
+/// would drop the stdout confirmation entirely.
+fn unlock_lines(
+    store: Option<vltr_core::session::SessionStore>,
+    save_error: Option<&str>,
+) -> Vec<SessionLine> {
+    if let Some(reason) = save_error {
+        return match store {
+            // Nothing is stored, so nothing can go stale: the next command
+            // simply asks for the password again, which is what this says.
+            None => vec![SessionLine::Stderr(format!(
+                "Vault unlocked, but no session could be saved ({reason}); the password will be \
+                 requested for future commands."
+            ))],
+            // A store DID answer — about the entry the failed write left
+            // behind, not about the key now in use. So the save cannot be
+            // claimed, and the stale entry has to be cleared before another
+            // unlock can write the right one.
+            Some(_) => vec![SessionLine::Stderr(format!(
+                "Vault unlocked for this command, but the new master key could not be saved to \
+                 the session store ({reason}); a session from an earlier unlock may still be \
+                 stored there with the old key, so every other command will fail until you run \
+                 `vltr lock` and `vltr unlock` again."
+            ))],
+        };
+    }
+    match store {
+        Some(vltr_core::session::SessionStore::Keyring) => {
+            vec![SessionLine::Stdout(
+                "Vault unlocked (session saved in OS keyring).".into(),
+            )]
+        }
+        Some(vltr_core::session::SessionStore::Memory) => vec![SessionLine::Stdout(
+            "Vault unlocked (OS keyring unavailable; local session file in use).".into(),
+        )],
+        None => vec![SessionLine::Stderr(
+            "Vault unlocked, but no session could be started; the password will be requested for \
+             future commands."
+                .into(),
+        )],
+    }
+}
+
 fn warn_if_session_unavailable(app: &mut App) {
     if let Some(reason) = app.take_session_error() {
         eprintln!("Warning: no session store could be saved ({reason}); the password will be requested for future commands.");
@@ -1414,6 +1488,117 @@ mod tests {
                 "Warning: no session store is available; the password will be requested for \
                  future commands."
             ],
+        );
+    }
+
+    /// Everything `unlock` prints, whatever stream each line goes to.
+    fn unlock_says(lines: &[SessionLine]) -> String {
+        lines
+            .iter()
+            .map(|line| match line {
+                SessionLine::Stdout(text) | SessionLine::Stderr(text) => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// `unlock` must not claim a session was saved when the save FAILED.
+    ///
+    /// This is the case that lies. `save_master_key` fails writing the NEW
+    /// master key while the PREVIOUS entry is still in place — a keyring that
+    /// refuses the write, a full data dir — so `session_store()` answers
+    /// `Some(Keyring)`. The arm that answered used to print "session saved in
+    /// OS keyring" without ever reading the pending error, which is available
+    /// and is the only thing that knows the truth.
+    ///
+    /// What the user is left with is the worst combination available: the
+    /// vault is encrypted under the new key, the stored session still holds the
+    /// old one, and the command they just ran told them it was all fine. Here
+    /// the symptom is not a missing warning but a positive statement that is
+    /// false — strictly worse than the same bug in `print_session_status`.
+    #[test]
+    fn unlock_never_claims_a_session_saved_when_the_save_failed() {
+        use vltr_core::session::SessionStore;
+        let reason = "keyring: no such interface";
+
+        for store in [Some(SessionStore::Keyring), Some(SessionStore::Memory)] {
+            let lines = unlock_lines(store, Some(reason));
+            let said = unlock_says(&lines);
+
+            assert!(
+                !said.contains("saved in OS keyring"),
+                "{store:?}: the store answering does not mean the NEW key was saved — \
+                 the entry it points at may still be the previous one. Got: {said}"
+            );
+            assert!(
+                !said.contains("session saved"),
+                "{store:?}: no wording may assert a save that failed. Got: {said}"
+            );
+            assert!(
+                said.contains(reason),
+                "{store:?}: the failure itself has to be shown. Got: {said}"
+            );
+            assert!(
+                said.contains("vltr lock") && said.contains("vltr unlock"),
+                "{store:?}: the stale entry has to be cleared and rewritten, so both steps \
+                 have to be named. Got: {said}"
+            );
+            assert_eq!(
+                lines,
+                vec![SessionLine::Stderr(said.clone())],
+                "{store:?}: a failed save is one warning, and on stderr — stdout is what a \
+                 user of `vltr unlock` reads as the confirmation. Got: {lines:?}"
+            );
+        }
+    }
+
+    /// The counterpart, so the fix above cannot pass by muting `unlock`: when
+    /// the save worked, it still prints exactly the three sentences it printed
+    /// before, on the streams it printed them on.
+    #[test]
+    fn a_successful_unlock_prints_exactly_what_it_printed_before() {
+        use vltr_core::session::SessionStore;
+
+        assert_eq!(
+            unlock_lines(Some(SessionStore::Keyring), None),
+            vec![SessionLine::Stdout(
+                "Vault unlocked (session saved in OS keyring).".into()
+            )],
+        );
+        assert_eq!(
+            unlock_lines(Some(SessionStore::Memory), None),
+            vec![SessionLine::Stdout(
+                "Vault unlocked (OS keyring unavailable; local session file in use).".into()
+            )],
+        );
+        assert_eq!(
+            unlock_lines(None, None),
+            vec![SessionLine::Stderr(
+                "Vault unlocked, but no session could be started; the password will be requested \
+                 for future commands."
+                    .into()
+            )],
+        );
+    }
+
+    /// The fourth pre-existing sentence, kept: no store AND a failed save is not
+    /// the stale-entry case — nothing is stored, so nothing can hold an old key
+    /// — and this is the wording it always had, asking for the password again.
+    #[test]
+    fn a_failed_save_with_no_store_is_not_reported_as_a_stale_entry() {
+        let lines = unlock_lines(None, Some("data dir is full"));
+        assert_eq!(
+            lines,
+            vec![SessionLine::Stderr(
+                "Vault unlocked, but no session could be saved (data dir is full); the password \
+                 will be requested for future commands."
+                    .into()
+            )],
+        );
+        assert!(
+            !unlock_says(&lines).contains("old key"),
+            "with nothing stored there is no old key to clear. Got: {}",
+            unlock_says(&lines)
         );
     }
 }
