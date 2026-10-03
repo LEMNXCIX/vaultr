@@ -364,10 +364,24 @@ comprobaciones hechas, no pasos pendientes:
 |---|---|
 | 11 | 0 filas vivas en las tres tablas tras el reset; `key_epoch` = remoto+1; `key_change = 'reset'`; `key_changed_at` poblado; salt distinto |
 | 12 | `value_encrypted` y `nonce` **byte-idénticos** antes y después (sha256 comparados contra el dump previo). El reset no re-cifra nada |
+| 13 | Sin vault remoto, `vltr reset` online sale con **código 0** y dice *"No hay vault remoto que borrar; el reset local está completo."* No se empujó ninguna fila |
 | 14 | Wipe interrumpido a medias: el `vltr sync` siguiente **terminó el borrado y completó el sync**, sin pedir la master password |
 | 15 | El prompt a/b/c con `key_epoch` y `key_change`; opción no reconocida vuelve a preguntar; `Enter` solo = cancelar; nada sube ni baja antes de decidir |
+| 16 | Opción a): con password remota **incorrecta** falla sin destruir nada; con la correcta descarta el vault local, que queda vacío y abre con la nueva, y la vieja deja de abrir |
 | 17 | Opción b): las filas de B vuelven al remoto y `vltr ls` las muestra |
+| 18 | Opción c): no cambia nada, el vault sigue funcionando con su propia password, el remoto no se toca y el siguiente sync vuelve a preguntar |
 | 19 | Opción b) con datos pre-sincronizados: sobreviven **proyecto, entornos y variables**, y los tres quedan `deleted = false` en el remoto |
+| 20 | Backup restaurado de **antes** del reset: da el prompt de divergencia, no un error opaco de contraseña, y b) funciona |
+
+**Los 12 puntos ejecutados (9-20).** El 13 sin una segunda cuenta, simulando el
+estado: `owner_id` está indexado por `auth.uid()`, así que "cuenta sin vault
+remoto" es exactamente "ninguna fila con mi `owner_id`". Se comprobó que
+`vltr init` **no** crea la fila remota —sin lo cual la precondición no se
+cumpliría—, y se movió el `owner_id` de las cuatro tablas a un UUID temporal,
+previa fila en `auth.users` porque las cuatro tienen FK `owner_id → auth.users`.
+Restaurado después y cotejado contra el snapshot: 1 vault, 9 proyectos, 11
+entornos, 104 variables y la fila del vault idéntica byte a byte. El reset de
+la prueba no escribió nada.
 
 **Sobre el TLD `.test`.** Este documento decía que los puntos 9-20 no se podían
 ejecutar porque GoTrue rechaza `.test`. **La primera mitad es cierta y la
@@ -386,13 +400,20 @@ por defecto, que es la firma de una fila sembrada por SQL y por tanto creada
 sin pasar por la validación del signup.
 
 Lo que bloqueaba el checklist no era el TLD: era que **no se conocía la master
-password del vault sembrado**, y eso se resolvió con `vltr reset`. Por eso los
-puntos se ejecutan contra la cuenta existente, y el único que no se puede
-ejecutar es el **13**, que necesita una cuenta nueva.
+password del vault sembrado**, y eso se resolvió con `vltr reset`. Y el punto
+13, que parecía necesitar una cuenta nueva, no lo requiere: basta con que la
+cuenta no tenga fila propia, que es lo que se simuló.
 
-> Dos correcciones sucesivas a esta misma nota quedaron ambas a medias antes de
-> quedar bien. La primera fue afirmativa en exceso; la segunda, que es esta, la
-> verifiqué con las cuatro comprobaciones de la tabla.
+> **Tres correcciones sucesivas a esta misma nota**, todas a medias antes de
+> quedar bien. La primera afirmó más de lo que la evidencia sostenía. La segunda
+> corrigió en el sentido contrario y esa también era falsa: el `signup` sobre un
+> email existente devuelve un `200` con usuario **fabricado** (anti-enumeración)
+> y no crea fila, lo que se leyó como prueba de que el TLD funcionaba. La
+> tercera, que es esta, verificó las cuatro comprobaciones de la tabla y
+> reconoce que el punto 13 tampoco necesitaba una cuenta nueva. La moraleja no
+> es sobre el TLD: es que **esta nota llevaba días escrita como verdad sin que
+> nadie la comprobara**, y las tres versiones equivocadas incluían la misma
+> suposición sin verificar.
 
 Dos bugs encontró esa corrida y ya están arreglados: `PGRST102` (un push
 masivo con filas de distinto conjunto de claves lo rechazaba entero, lo que
