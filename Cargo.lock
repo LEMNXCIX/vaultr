@@ -2395,6 +2395,7 @@ dependencies = [
  "hex",
  "keyring",
  "models",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",

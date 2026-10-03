@@ -26,6 +26,9 @@ directories = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# To put a hand-written body on the wire in bulk_push_http.rs: the PostgREST
+# contract has to be tested against a shape no DTO would ever produce.
+reqwest = { workspace = true }
 # For the in-process HTTP harness in tests/ and to drive it the way the CLI
 # does (single-threaded runtime, no #[tokio::test] default).
 tokio = { workspace = true }

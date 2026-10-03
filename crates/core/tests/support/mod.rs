@@ -11,6 +11,15 @@
 //! the client actually left behind (and the bytes it actually sent), rather
 //! than re-deriving them from the client side.
 //!
+//! # It must not be laxer than PostgREST
+//!
+//! A fake server earns its keep by failing where the real one fails. This one
+//! enforces PostgREST's bulk-upsert contract — one set of keys across the whole
+//! batch, or `PGRST102` / 400 — because it learned that lesson the expensive
+//! way: without it, nine tests across this directory passed while the real sync
+//! of any vault holding one described project and one undescribed project
+//! failed with a 400. See [`pgrst102`].
+//!
 //! # Nothing here can reach the keyring
 //!
 //! `Remote::start` points [`SUPABASE_URL_ENV`], [`SUPABASE_KEY_ENV`] and
@@ -266,8 +275,8 @@ impl Respond for PushVaults {
                 .set_body_json(json!({ "message": "injected push failure" }));
         }
         // `return=minimal`: the client only checks the status code.
-        upsert_all(&mut store.vaults, "owner_id", request);
-        ResponseTemplate::new(201)
+        upsert_all(&mut store.vaults, "owner_id", request)
+            .unwrap_or_else(|| ResponseTemplate::new(201))
     }
 }
 
@@ -277,8 +286,8 @@ struct PushRows(Arc<Mutex<Store>>, &'static str);
 impl Respond for PushRows {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let mut store = lock(&self.0);
-        upsert_all(store.table_mut(self.1), "id", request);
-        ResponseTemplate::new(201)
+        upsert_all(store.table_mut(self.1), "id", request)
+            .unwrap_or_else(|| ResponseTemplate::new(201))
     }
 }
 
@@ -303,11 +312,60 @@ impl Respond for GetRows {
     }
 }
 
-fn upsert_all(rows: &mut Vec<Value>, conflict_key: &str, request: &Request) {
+/// PostgREST's bulk-upsert contract: every row of one POST must carry the
+/// same set of keys, or the server rejects the batch with `PGRST102`.
+///
+/// Returns the rejection to send, or `None` if the batch is well-formed. A
+/// one-row payload is trivially uniform, which is why `push_vault` — a
+/// single-row upsert — is unaffected by any of this.
+///
+/// The check exists because it was measured, not because it is tidy. With
+/// `skip_serializing_if` on the optional columns of the row DTOs, a described
+/// project and an undescribed one serialised to different shapes and the real
+/// server answered 400 — while this fake, being more permissive than the
+/// server, answered 201 and let every sync test in this directory stay green.
+/// A fake that is laxer than the thing it stands in for does not merely fail
+/// to help: it certifies the bug.
+fn pgrst102(rows: &[Value]) -> Option<ResponseTemplate> {
+    let mut expected: Option<Vec<String>> = None;
+    for row in rows {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        let mut keys: Vec<String> = object.keys().cloned().collect();
+        keys.sort();
+        match &expected {
+            None => expected = Some(keys),
+            Some(first) if first != &keys => {
+                // Body and status verbatim from PostgREST, so an assertion
+                // written against the real server holds here too.
+                return Some(ResponseTemplate::new(400).set_body_json(json!({
+                    "code": "PGRST102",
+                    "message": "All object keys must match",
+                })));
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Apply a POST body to `rows`, or refuse it. A refusal must apply nothing at
+/// all: PostgREST rejects the batch as a unit, and a fake that half-applied it
+/// would hide the very failure it is meant to reproduce.
+fn upsert_all(
+    rows: &mut Vec<Value>,
+    conflict_key: &str,
+    request: &Request,
+) -> Option<ResponseTemplate> {
     let body: Vec<Value> = serde_json::from_slice(&request.body).unwrap_or_default();
+    if let Some(rejection) = pgrst102(&body) {
+        return Some(rejection);
+    }
     for row in body {
         upsert(rows, conflict_key, row);
     }
+    None
 }
 
 fn lock(store: &Arc<Mutex<Store>>) -> MutexGuard<'_, Store> {
