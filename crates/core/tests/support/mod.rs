@@ -20,6 +20,11 @@
 //! of any vault holding one described project and one undescribed project
 //! failed with a 400. See [`pgrst102`].
 //!
+//! It also refuses an explicit `null` in `updated_at` (`23502`), the other half
+//! of the same lesson: the server's columns are `NOT NULL`, so a row carrying
+//! `"updated_at": null` is a 400 there and nothing at all here. See
+//! [`not_null_23502`].
+//!
 //! # Nothing here can reach the keyring
 //!
 //! `Remote::start` points [`SUPABASE_URL_ENV`], [`SUPABASE_KEY_ENV`] and
@@ -275,7 +280,7 @@ impl Respond for PushVaults {
                 .set_body_json(json!({ "message": "injected push failure" }));
         }
         // `return=minimal`: the client only checks the status code.
-        upsert_all(&mut store.vaults, "owner_id", request)
+        upsert_all(&mut store.vaults, "owner_id", "vaults", request)
             .unwrap_or_else(|| ResponseTemplate::new(201))
     }
 }
@@ -286,7 +291,7 @@ struct PushRows(Arc<Mutex<Store>>, &'static str);
 impl Respond for PushRows {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let mut store = lock(&self.0);
-        upsert_all(store.table_mut(self.1), "id", request)
+        upsert_all(store.table_mut(self.1), "id", self.1, request)
             .unwrap_or_else(|| ResponseTemplate::new(201))
     }
 }
@@ -350,16 +355,50 @@ fn pgrst102(rows: &[Value]) -> Option<ResponseTemplate> {
     None
 }
 
+/// Postgres's `NOT NULL`, as the server applies it to a POST body.
+///
+/// Every table this fake serves declares
+/// `updated_at timestamptz not null default now()`
+/// (`supabase/migrations/0001_init.sql`), and Postgres draws the line between
+/// the two shapes like this:
+///
+/// * a key **absent** from the payload takes the column default — legal;
+/// * a key **present and null** is an attempt to write SQL `NULL` into a
+///   `NOT NULL` column, and the server answers 400 with `23502`.
+///
+/// Only the second is a violation, and that distinction is the entire content
+/// of the client's own refusal (`push_rows` rejects a null `updated_at` before
+/// the wire): were this fake laxer, a null would sail through every sync test
+/// in this directory and the first place it could surface would be a user's
+/// real vault.
+fn not_null_23502(table: &str, rows: &[Value]) -> Option<ResponseTemplate> {
+    let refused = rows
+        .iter()
+        .any(|row| matches!(row.get("updated_at"), Some(Value::Null)));
+    if !refused {
+        return None;
+    }
+    // Body and status as Postgres reports them, so an assertion written
+    // against the real server holds here too.
+    Some(ResponseTemplate::new(400).set_body_json(json!({
+        "code": "23502",
+        "message": format!(
+            "null value in column \"updated_at\" of relation \"{table}\" violates not-null constraint"
+        ),
+    })))
+}
+
 /// Apply a POST body to `rows`, or refuse it. A refusal must apply nothing at
 /// all: PostgREST rejects the batch as a unit, and a fake that half-applied it
 /// would hide the very failure it is meant to reproduce.
 fn upsert_all(
     rows: &mut Vec<Value>,
     conflict_key: &str,
+    table: &str,
     request: &Request,
 ) -> Option<ResponseTemplate> {
     let body: Vec<Value> = serde_json::from_slice(&request.body).unwrap_or_default();
-    if let Some(rejection) = pgrst102(&body) {
+    if let Some(rejection) = pgrst102(&body).or_else(|| not_null_23502(table, &body)) {
         return Some(rejection);
     }
     for row in body {
