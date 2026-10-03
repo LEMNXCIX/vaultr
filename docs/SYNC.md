@@ -369,15 +369,32 @@ comprobaciones hechas, no pasos pendientes:
 | 17 | Opción b): las filas de B vuelven al remoto y `vltr ls` las muestra |
 | 19 | Opción b) con datos pre-sincronizados: sobreviven **proyecto, entornos y variables**, y los tres quedan `deleted = false` en el remoto |
 
-**Corrección (2026-10-03).** Este documento decía antes que los puntos 9-20
-"no se pueden ejecutar" porque GoTrue rechazaba el TLD `.test` con
-`400 email_address_invalid`. **Eso era falso**: la cuenta existe, está
-confirmada y el login funciona. El bloqueo real era otro — la master password
-del vault sembrado no se conocía — y se resolvió con `vltr reset`. Lo que sí
-era cierto es lo otro: la suite unitaria no cubría los caminos HTTP, y por eso
-estos puntos los encontró el E2E y no los tests.
+**Sobre el TLD `.test`.** Este documento decía que los puntos 9-20 no se podían
+ejecutar porque GoTrue rechaza `.test`. **La primera mitad es cierta y la
+segunda no.** Comprobado contra el proyecto:
 
-Dos bugs los encontró esa corrida y ya están arreglados: `PGRST102` (un push
+| | |
+|---|---|
+| `signup` con un `.test` **nuevo** | **HTTP 400** · `Email address "…" is invalid` |
+| `signup` con un email **ya existente** | HTTP 200 con un usuario **fabricado**; no se crea ninguna fila |
+| `login` de `e2e@vaultr.test` | funciona |
+
+Es decir: `.test` **no** se puede registrar, y la confirmación de email tampoco
+llegaría a un dominio inexistente. Pero la cuenta `e2e@vaultr.test` **ya
+existe** y sirve: su hash es bcrypt con coste **6**, no el 10 que usa Supabase
+por defecto, que es la firma de una fila sembrada por SQL y por tanto creada
+sin pasar por la validación del signup.
+
+Lo que bloqueaba el checklist no era el TLD: era que **no se conocía la master
+password del vault sembrado**, y eso se resolvió con `vltr reset`. Por eso los
+puntos se ejecutan contra la cuenta existente, y el único que no se puede
+ejecutar es el **13**, que necesita una cuenta nueva.
+
+> Dos correcciones sucesivas a esta misma nota quedaron ambas a medias antes de
+> quedar bien. La primera fue afirmativa en exceso; la segunda, que es esta, la
+> verifiqué con las cuatro comprobaciones de la tabla.
+
+Dos bugs encontró esa corrida y ya están arreglados: `PGRST102` (un push
 masivo con filas de distinto conjunto de claves lo rechazaba entero, lo que
 rompía el sync normal, no solo el reset) y la adopción, que fallaba al
 descifrar tombstones de una clave antigua y dejaba la opción "conservar lo

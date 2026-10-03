@@ -22,7 +22,7 @@ Este plan cubre la sección 1–3 del spec. **No** cubre el comando `vltr reset`
 - Migración Supabase: archivo nuevo bajo `supabase/migrations/`, applied-only-additive (sin `drop`).
 - Ningún archivo nuevo de código en `core` que contenga lógica de negocio de sync: `crates/core/src/sync.rs` ya la tiene y sigue siendo su casa.
 - Base de test de Supabase: `https://qabqeiyyviauvxzmblze.supabase.co`, publishable key `sb_publishable_Cmt3PDbV0ACaOMLHW01Ong_pJ1WhzWE` (solo lectura/anón; nunca `service_role`).
-- **CORREGIDO el 2026-10-03:** esta nota era falsa. GoTrue no rechaza el TLD `.test`; `e2e@vaultr.test` existe, está confirmada y el login funciona. El bloqueo real era la master password del vault sembrado, que se desconocía.
+- **ACLARADO el 2026-10-03:** esta nota era correcta en su afirmación — GoTrue **sí** rechaza el TLD `.test` en el signup (`400 Email address "…" is invalid`, comprobado). Lo que estaba mal era la conclusión: `e2e@vaultr.test` **sí** sirve, existe, está confirmada y el login funciona. Fue sembrada por SQL, así que nunca pasó por la validación del signup (bcrypt coste 6, no el 10 por defecto). El bloqueo real para correr el checklist era la master password del vault sembrado, que se desconocía.
 
 ## Review Focus
 

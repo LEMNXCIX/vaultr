@@ -1011,7 +1011,7 @@ Add the three choices — discard local, keep local, cancel — with what each d
 
 Add steps covering: a reset with the wrong confirmation phrase aborts untouched; a successful reset leaves the remote with zero live rows; a second device prompts on its next sync and its three choices do what the docs say; a reset interrupted mid-wipe is completed by the next sync.
 
-CORRECTED 2026-10-03: this was false. GoTrue does not reject the `.test` TLD; `e2e@vaultr.test` exists and authenticates. The real blocker was the unknown master password of the seeded vault, solved with `vltr reset`.
+CLARIFIED 2026-10-03: the `.test` TLD **is** rejected by signup (`400 Email address "…" is invalid`), so this note was right. What was wrong was the conclusion drawn from it — that the account was unusable. `e2e@vaultr.test` exists, is confirmed and authenticates; it was SQL-seeded, which is why its bcrypt cost is 6 rather than the default 10. `signup` on an existing address returns a fabricated 200 without creating a row. The real blocker was the seeded vault's unknown master password, solved with `vltr reset`.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -1029,5 +1029,5 @@ git commit -m "docs(sync): document reset and the divergence prompt"
 ## Execution notes
 
 - **This plan has no server migration.** Every column it needs landed in `0002_key_epoch_verifier.sql`. If you find yourself wanting a new column, that is a design question, not an implementation detail — stop and report.
-- **SUPERSEDED 2026-10-03.** Two claims here were wrong. (1) `e2e@vaultr.test` is not rejected by GoTrue — it exists and authenticates. (2) The HTTP paths are now covered: four integration tests against a PostgREST harness (`crates/core/tests/reset_sync_http.rs`) plus an end-to-end run against the live project, which is what found `PGRST102` and the adoption bug the harness had missed.
+- **PARTLY SUPERSEDED 2026-10-03.** Claim (1) was wrong in the other direction: `.test` *is* rejected by signup, so this note was right; what was wrong was inferring that the existing account was unusable — it works, because it was SQL-seeded. Claim (2) stands and grew: the HTTP paths are covered by five integration tests against a PostgREST harness (`crates/core/tests/reset_sync_http.rs`, `bulk_push_http.rs`) plus an end-to-end run against the live project, which found `PGRST102` and the adoption bug the harness had missed. Checklist points 11, 12, 14–20 executed; only point 13, which needs a second account, is outstanding.
 - **Do not write to the Supabase project** while implementing this plan. The reset's whole point is to wipe a remote, and this project's remote holds the user's real 101 encrypted variables.

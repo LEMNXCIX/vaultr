@@ -206,12 +206,21 @@ Recuperar el password de Supabase, que es la precondición para el reset online.
 Restricciones a documentar: el correo de la cuenta debe ser entregable, porque
 la confirmación de email no se puede recibir en un dominio inexistente.
 
-> **Corrección (2026-10-03).** Este spec afirmaba, como verificado, que GoTrue
-> rechaza el TLD `.test` con `400 email_address_invalid`. Es falso: `e2e@vaultr.test`
-> se puede registrar, confirmar y autenticar contra el proyecto real. No lo
-> comprobamos hasta esa fecha, y la suposición se propagó a tres documentos más
-> como si fuera un hecho. Lo que sí es cierto es la necesidad de un correo
-> entregable, por la confirmación.
+> **Aclaración (2026-10-03).** Este spec afirmaba, como verificado, que GoTrue
+> rechaza el TLD `.test`. **Es cierto**, comprobado el 2026-10-03: `signup` con
+> un `.test` nuevo responde `400 Email address "…" is invalid`.
+>
+> Lo que estaba mal era la conclusión que se derivó: que la cuenta
+> `e2e@vaultr.test` no servía. Sí sirve — existe, está confirmada y autentica.
+> Fue sembrada por SQL, y por eso nunca pasó por la validación del signup: su
+> hash es bcrypt con coste 6, no el 10 por defecto de Supabase. Dos detalles que
+> hicieron parecer lo contrario: `signup` sobre un email **existente** devuelve
+> `200` con un usuario **fabricado** (anti-enumeración) sin crear ninguna fila, y
+> `login` funciona sin tocar nada de eso.
+>
+> Conclusión operativa: el TLD bloquea **crear cuentas**, no **usar** una ya
+> existente. Por eso el checklist corre contra esa cuenta y lo único que no se
+> puede ejecutar es el punto 13, que necesita una segunda.
 
 Orden recomendado, y el que la CLI debe sugerir cuando ambas fallen: `vltr recover`
 primero, `vltr reset` después.
