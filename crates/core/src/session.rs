@@ -150,7 +150,7 @@ fn keyring_calls() -> usize {
 mod keyring_fault {
     use std::cell::Cell;
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum DeleteFault {
         /// Consult the backend.
         None,
@@ -175,9 +175,26 @@ mod keyring_fault {
         static DELETE_FAULT: Cell<DeleteFault> = const { Cell::new(DeleteFault::None) };
     }
 
-    /// Arm the fault and hand the previous state back, so a test can restore it.
-    pub(super) fn arm(fault: DeleteFault) -> DeleteFault {
-        DELETE_FAULT.with(|cell| cell.replace(fault))
+    /// Arm the fault for as long as the returned guard lives.
+    ///
+    /// A guard, not a bare setter: libtest reuses its worker threads across
+    /// tests, so a fault left armed outlives the test that wanted it and lands
+    /// on whatever runs next in that thread. Restoring by hand is only safe
+    /// while nobody panics between arming and restoring — which is exactly what
+    /// a failing assertion in that gap would do, turning one clear failure into
+    /// a cascade of unrelated ones. Dropping the guard unwinds it out of the
+    /// way.
+    pub(super) struct Armed(#[allow(dead_code)] DeleteFault);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            DELETE_FAULT.with(|cell| cell.set(self.0));
+        }
+    }
+
+    pub(super) fn arm(fault: DeleteFault) -> Armed {
+        let previous = DELETE_FAULT.with(|cell| cell.replace(fault));
+        Armed(previous)
     }
 
     pub(super) fn armed() -> DeleteFault {
@@ -799,9 +816,10 @@ mod tests {
         std::env::remove_var("VLTR_SESSION_FILE");
 
         // A backend that holds the entry and answers the delete with a refusal.
-        keyring_fault::arm(keyring_fault::DeleteFault::Refused);
+        // The guard disarms on drop, so a panic below cannot leave the fault
+        // armed for the next test libtest happens to run on this thread.
+        let _fault = keyring_fault::arm(keyring_fault::DeleteFault::Refused);
         let result = clear_session(Some(&db));
-        keyring_fault::arm(keyring_fault::DeleteFault::None);
 
         // `vltr lock` prints "Session cleared." exactly when this returns `Ok`.
         // The master key is still in that keyring, so the vault is still open.
@@ -809,6 +827,30 @@ mod tests {
         assert!(
             error.to_string().contains("keyring"),
             "the error must name the store that refused, got: {error}"
+        );
+    }
+
+    #[test]
+    fn an_armed_fault_does_not_outlive_the_test_that_armed_it() {
+        // libtest reuses worker threads, so a fault armed by one test reaches
+        // whatever runs next in that thread unless something unwinds it out.
+        // Restoring by hand does not: a failing assertion in the gap between
+        // arming and restoring skips the restore, and one clear failure becomes
+        // a cascade of unrelated ones. The guard is what prevents that.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = keyring_fault::arm(keyring_fault::DeleteFault::Refused);
+            panic!("a test that fails while the fault is armed");
+        });
+        std::panic::set_hook(previous);
+
+        assert!(unwound.is_err(), "the panic must actually have unwound");
+        assert_eq!(
+            keyring_fault::armed(),
+            keyring_fault::DeleteFault::None,
+            "the fault survived its test: the next test on this thread would \
+             inherit a keyring failure nobody asked for"
         );
     }
 
@@ -821,9 +863,9 @@ mod tests {
 
         // The trap the fix has to avoid: on a WSL box or a headless machine
         // there is no entry, or no backend at all, and `lock` must still work.
-        keyring_fault::arm(keyring_fault::DeleteFault::NoEntry);
+        let _fault = keyring_fault::arm(keyring_fault::DeleteFault::NoEntry);
         let absent = clear_session(Some(&db));
-        keyring_fault::arm(keyring_fault::DeleteFault::None);
+        drop(_fault);
 
         absent.unwrap_or_else(|e| panic!("an absent entry is not a failure: {e}"));
 
