@@ -25,7 +25,6 @@ directories = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-secrecy = { workspace = true }
 wiremock = { workspace = true }
 # For the in-process HTTP harness in tests/ and to drive it the way the CLI
 # does (single-threaded runtime, no #[tokio::test] default).
