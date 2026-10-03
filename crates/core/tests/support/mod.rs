@@ -110,8 +110,27 @@ impl Store {
         &self.projects
     }
 
+    pub fn environments(&self) -> &[Value] {
+        &self.environments
+    }
+
     pub fn variables(&self) -> &[Value] {
         &self.variables
+    }
+
+    /// base64 salt of the `vaults` row plus the counter a reset must advance.
+    pub fn vault_epoch(&self) -> Option<i64> {
+        self.vault()
+            .and_then(|v| v.get("key_epoch").and_then(Value::as_i64))
+    }
+
+    /// The `key_change` label the last vault-meta push published.
+    pub fn vault_key_change(&self) -> Option<String> {
+        self.vault().and_then(|v| {
+            v.get("key_change")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
     }
 
     /// Insert variable rows directly, as another device (or a previous run)
