@@ -97,8 +97,39 @@ fn session_account(db_path: &Path) -> String {
 }
 
 fn entry(db_path: &Path) -> Result<Entry, CoreError> {
+    #[cfg(test)]
+    keyring_probe::record();
     let account = format!("{KEYRING_ACCOUNT}-{}", session_account(db_path));
     Entry::new(KEYRING_SERVICE, &account).map_err(|e| CoreError::Other(format!("keyring: {e}")))
+}
+
+/// Test-only count of keyring requests made by this thread. The override tests
+/// need to prove the keyring was skipped *without* touching the real one, and
+/// "the session round-tripped" cannot show that: a run that consulted the
+/// keyring would still leave the user's own session intact (it is
+/// per-database), but it would also mean the override does not own the
+/// session — and on a machine whose keyring works, `save` would write the real
+/// entry for that vault.
+#[cfg(test)]
+mod keyring_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static KEYRING_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn calls() -> usize {
+        KEYRING_CALLS.with(Cell::get)
+    }
+
+    pub fn record() {
+        KEYRING_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+}
+
+#[cfg(test)]
+fn keyring_calls() -> usize {
+    keyring_probe::calls()
 }
 
 fn now_unix() -> u64 {
@@ -140,6 +171,14 @@ fn decode_key(key_hex: &str) -> Option<MasterKey> {
 /// file at the current directory instead of the per-database fallback. Blank
 /// therefore means "not set". A non-blank value is used verbatim, including a
 /// non-UTF-8 path.
+///
+/// A non-blank value also **disables the keyring**, the same way
+/// `VLTR_SYNC_SESSION_FILE` does for the account session: it owns the whole
+/// session, not just the file half. Redirecting only the fallback would still
+/// consult — and write — the real entry, which is useless for the two things
+/// the override exists for: a test run cannot borrow the user's keyring, and a
+/// machine with no usable keyring has no fallback to redirect. See
+/// [`save_master_key`].
 fn session_file_override() -> Option<std::path::PathBuf> {
     let raw = std::env::var_os("VLTR_SESSION_FILE")?;
     if raw.to_str().is_some_and(|raw| raw.trim().is_empty()) {
@@ -252,10 +291,17 @@ fn stop_memory_file(db_path: &Path) -> Result<(), CoreError> {
 /// `db_path = None` (in-memory storage) persists nothing: there is no database
 /// to scope the session to, so a global entry would let an in-memory vault
 /// overwrite any real one.
+///
+/// `VLTR_SESSION_FILE` set to a non-blank path bypasses the keyring entirely
+/// (see [`session_file_override`]).
 pub fn save_master_key(db_path: Option<&Path>, key: &MasterKey) -> Result<(), CoreError> {
     let Some(db_path) = db_path else {
         return Ok(());
     };
+    // Override: solo el archivo, el keyring no se toca.
+    if session_file_override().is_some() {
+        return save_memory_file(db_path, key);
+    }
     if save_keyring(db_path, key) {
         let _ = stop_memory_file(db_path);
         return Ok(());
@@ -269,6 +315,10 @@ pub fn load_master_key(db_path: Option<&Path>) -> Result<Option<MasterKey>, Core
     let Some(db_path) = db_path else {
         return Ok(None);
     };
+    // Override: se lee el archivo, el keyring no se toca.
+    if session_file_override().is_some() {
+        return load_memory_file(db_path);
+    }
     if let Some(key) = load_keyring(db_path)? {
         return Ok(Some(key));
     }
@@ -280,6 +330,10 @@ pub fn clear_session(db_path: Option<&Path>) -> Result<(), CoreError> {
     let Some(db_path) = db_path else {
         return Ok(());
     };
+    // Override: se borra el archivo y el keyring no se toca.
+    if session_file_override().is_some() {
+        return stop_memory_file(db_path);
+    }
     let _ = clear_keyring(db_path);
     let _ = stop_memory_file(db_path);
     Ok(())
@@ -290,11 +344,15 @@ pub fn inspect(db_path: Option<&Path>) -> Result<Option<SessionInfo>, CoreError>
     let Some(db_path) = db_path else {
         return Ok(None);
     };
-    if let Some(remaining_secs) = keyring_seconds_remaining(db_path)? {
-        return Ok(Some(SessionInfo {
-            remaining_secs,
-            store: SessionStore::Keyring,
-        }));
+    // Con override la sesión vive en el archivo: reportar "OS keyring" sería
+    // mentir, porque ni `load_master_key` ni `clear_session` lo mirarían.
+    if session_file_override().is_none() {
+        if let Some(remaining_secs) = keyring_seconds_remaining(db_path)? {
+            return Ok(Some(SessionInfo {
+                remaining_secs,
+                store: SessionStore::Keyring,
+            }));
+        }
     }
     if let Some(remaining_secs) = memory_seconds_remaining(db_path)? {
         return Ok(Some(SessionInfo {
@@ -556,6 +614,133 @@ mod tests {
         assert!(load_master_key(None).unwrap().is_none());
         assert!(inspect(None).unwrap().is_none());
         clear_session(None).unwrap();
+
+        std::env::remove_var("VLTR_SESSION_FILE");
+    }
+
+    #[test]
+    fn session_file_override_owns_the_session_and_skips_the_keyring() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        let path = dir.path().join("session.json");
+        std::env::set_var("VLTR_SESSION_FILE", &path);
+
+        // Control: the probe must observe a keyring request, otherwise the
+        // assertion at the end of this test would pass vacuously.
+        // `Entry::new` only builds the entry, it never reaches the backend —
+        // counting it is enough to prove the keyring *path* was not taken.
+        let before = keyring_calls();
+        let _ = entry(&db);
+        assert_eq!(
+            keyring_calls(),
+            before + 1,
+            "probe must observe a keyring request"
+        );
+
+        let key = decode_key(&"1f".repeat(32)).unwrap();
+        save_master_key(Some(&db), &key).unwrap();
+        assert!(path.exists(), "override must be the file that gets written");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "session file must be 0600");
+        }
+
+        let loaded = load_master_key(Some(&db))
+            .unwrap()
+            .expect("override file must be read back");
+        assert_eq!(loaded.as_ref(), key.as_ref());
+
+        clear_session(Some(&db)).unwrap();
+        assert!(!path.exists(), "clear must remove the override file");
+        assert!(load_master_key(Some(&db)).unwrap().is_none());
+
+        // The load-bearing assertion: none of the above asked for the keyring.
+        assert_eq!(
+            keyring_calls(),
+            before + 1,
+            "the override must bypass the keyring entirely"
+        );
+
+        std::env::remove_var("VLTR_SESSION_FILE");
+    }
+
+    #[test]
+    fn session_file_override_keeps_inspect_off_the_keyring() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        let path = dir.path().join("session.json");
+        std::env::set_var("VLTR_SESSION_FILE", &path);
+
+        let key = decode_key(&"2e".repeat(32)).unwrap();
+        save_master_key(Some(&db), &key).unwrap();
+
+        // `vltr status` goes through `inspect`; reporting a keyring store that
+        // the load path would never consult is the same bug in read form.
+        let before = keyring_calls();
+        let info = inspect(Some(&db)).unwrap().expect("session is active");
+        assert_eq!(info.store, SessionStore::Memory);
+        assert!(info.remaining_secs > 0);
+        assert_eq!(
+            keyring_calls(),
+            before,
+            "inspect must not consult the keyring under the override"
+        );
+
+        clear_session(Some(&db)).unwrap();
+        std::env::remove_var("VLTR_SESSION_FILE");
+    }
+
+    #[test]
+    fn unset_or_blank_session_file_override_still_prefers_the_keyring() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+
+        // `save_master_key` is deliberately NOT called here: without the
+        // override it would write the *real* keyring entry for this vault,
+        // which is exactly what the override exists to prevent.
+        for value in [None, Some(""), Some("   ")] {
+            match value {
+                Some(v) => std::env::set_var("VLTR_SESSION_FILE", v),
+                None => std::env::remove_var("VLTR_SESSION_FILE"),
+            }
+            assert!(
+                session_file_override().is_none(),
+                "blank/unset must not be an override: {value:?}"
+            );
+
+            let before = keyring_calls();
+            assert!(load_master_key(Some(&db)).unwrap().is_none());
+            assert_eq!(
+                keyring_calls(),
+                before + 1,
+                "load consults the keyring first: {value:?}"
+            );
+
+            let before = keyring_calls();
+            assert!(
+                inspect(Some(&db)).unwrap().is_none(),
+                "no session was stored for {value:?}"
+            );
+            assert_eq!(
+                keyring_calls(),
+                before + 1,
+                "inspect consults the keyring first: {value:?}"
+            );
+
+            let before = keyring_calls();
+            clear_session(Some(&db)).unwrap();
+            assert_eq!(
+                keyring_calls(),
+                before + 1,
+                "clear consults the keyring first: {value:?}"
+            );
+        }
 
         std::env::remove_var("VLTR_SESSION_FILE");
     }

@@ -151,11 +151,11 @@ fn keyring_calls() -> usize {
 /// is an accident, not a path, and honoring it would write the account session
 /// to the current directory.
 ///
-/// Unlike `VLTR_SESSION_FILE` this one also *disables the keyring* (see
-/// [`KEYRING_ACCOUNT_SUPABASE`]): that account entry is global and shared by
-/// every vault, so a test run cannot use it without overwriting the user's real
-/// login. It exists so tests — and machines with no usable keyring — can run the
-/// sync paths against a file they own.
+/// Like `VLTR_SESSION_FILE` for the master key, this also *disables the
+/// keyring* (see [`KEYRING_ACCOUNT_SUPABASE`]): that account entry is global and
+/// shared by every vault, so a test run cannot use it without overwriting the
+/// user's real login. It exists so tests — and machines with no usable keyring —
+/// can run the sync paths against a file they own.
 fn sync_session_file_override() -> Option<std::path::PathBuf> {
     let raw = std::env::var_os("VLTR_SYNC_SESSION_FILE")?;
     if raw.to_str().is_some_and(|raw| raw.trim().is_empty()) {

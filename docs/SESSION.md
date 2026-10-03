@@ -6,7 +6,7 @@ Si el keyring no está disponible (servicio ausente, backend que no persiste, WS
 
 Cada uso exitoso de la sesión **renueva** el contador (sliding expiration). Si pasan 30 minutos sin usar la CLI, la sesión caduca y el siguiente comando pide password otra vez. El archivo se borra si expira o está corrupto.
 
-Para pruebas o debug se puede redirigir la ruta del archivo con la variable de entorno `VLTR_SESSION_FILE`.
+Para pruebas o debug se puede redirigir la sesión con la variable de entorno `VLTR_SESSION_FILE` (path no vacío). Igual que `VLTR_SYNC_SESSION_FILE`, manda la sesión **solo** a ese archivo y **desactiva el keyring**: si no, un run de tests escribiría la entrada real del keyring del developer, y una máquina sin keyring usable no tendría dónde caerse. Sin el override (unset o vacío) el orden sigue siendo keyring → archivo.
 
 **Tradeoff:** a diferencia del keyring, la clave descifrada reposa en disco mientras la sesión esté activa (protegida solo por el permiso `0600`), igual que hace `gh auth token`. Es el precio de funcionar sin keyring; usa `vltr lock` cuando termines.
 
@@ -58,7 +58,7 @@ vltr status    # muestra tiempo restante y el backend activo
 | Service (keyring) | `dev.secrets-manager.vault` (se conserva para no invalidar sesiones existentes) |
 | Account (keyring) | `master-key-session-<hash del path del vault>` (16 hex chars) |
 | Payload | JSON `{ key_hex, expires_at }` |
-| Ruta (fallback) | `~/.local/share/vaultr/session-<hash del path del vault>.json` (override: `VLTR_SESSION_FILE`) |
+| Ruta (fallback) | `~/.local/share/vaultr/session-<hash del path del vault>.json` (override: `VLTR_SESSION_FILE`, que además desactiva el keyring) |
 
 Un vault en memoria (tests) no persiste sesión: no hay archivo al cual asociarla.
 
