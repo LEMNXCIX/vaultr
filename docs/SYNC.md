@@ -354,12 +354,46 @@ Nota sobre deletes: los borrados se propagan como **tombstones**
 (`deleted = true`) y las filas nunca se eliminan físicamente del server; la
 limpieza del lado servidor puede requerir un ciclo extra de sync.
 
-Nota sobre los puntos de reset (9-20): son **pasos a ejecutar a mano**, no
-comprobaciones ya hechas. Los caminos HTTP del reset y del prompt a/b/c
-(`push_reset`, `reset_remote`, `discard_local_and_adopt`, `adopt_remote_key`) no los
-cubre la suite unitaria, que solo fija las partes puras: las tombstones, el epoch
-publicado, las ramas del guard de salt, el parseo de la confirmación y el de la
-opción, y el `reset_vault` de storage. El checklist es la cobertura real de esa
-parte. Necesitan además una cuenta de Supabase usable, y contra el proyecto de
-test de este repo no se pueden ejecutar: GoTrue rechaza el TLD reservado `.test`
-en `e2e@vaultr.test` con `400 email_address_invalid`.
+## Qué se ha comprobado contra un Supabase real
+
+Ejecutado el **2026-10-03** contra el proyecto de test de este repo
+(`qabqeiyyviauvxzmblze`), cuenta `e2e@vaultr.test`. Esto **sí** son
+comprobaciones hechas, no pasos pendientes:
+
+| Punto | Qué se verificó |
+|---|---|
+| 11 | 0 filas vivas en las tres tablas tras el reset; `key_epoch` = remoto+1; `key_change = 'reset'`; `key_changed_at` poblado; salt distinto |
+| 12 | `value_encrypted` y `nonce` **byte-idénticos** antes y después (sha256 comparados contra el dump previo). El reset no re-cifra nada |
+| 14 | Wipe interrumpido a medias: el `vltr sync` siguiente **terminó el borrado y completó el sync**, sin pedir la master password |
+| 15 | El prompt a/b/c con `key_epoch` y `key_change`; opción no reconocida vuelve a preguntar; `Enter` solo = cancelar; nada sube ni baja antes de decidir |
+| 17 | Opción b): las filas de B vuelven al remoto y `vltr ls` las muestra |
+| 19 | Opción b) con datos pre-sincronizados: sobreviven **proyecto, entornos y variables**, y los tres quedan `deleted = false` en el remoto |
+
+**Corrección (2026-10-03).** Este documento decía antes que los puntos 9-20
+"no se pueden ejecutar" porque GoTrue rechazaba el TLD `.test` con
+`400 email_address_invalid`. **Eso era falso**: la cuenta existe, está
+confirmada y el login funciona. El bloqueo real era otro — la master password
+del vault sembrado no se conocía — y se resolvió con `vltr reset`. Lo que sí
+era cierto es lo otro: la suite unitaria no cubría los caminos HTTP, y por eso
+estos puntos los encontró el E2E y no los tests.
+
+Dos bugs los encontró esa corrida y ya están arreglados: `PGRST102` (un push
+masivo con filas de distinto conjunto de claves lo rechazaba entero, lo que
+rompía el sync normal, no solo el reset) y la adopción, que fallaba al
+descifrar tombstones de una clave antigua y dejaba la opción "conservar lo
+local" inalcanzable.
+
+### Preparar el entorno
+
+```bash
+export VAULTR_SUPABASE_URL=https://<project>.supabase.co
+export VAULTR_SUPABASE_KEY=sb_publishable_...
+export SECRETS_DB=/tmp/e2e/vault.db          # nunca el vault real
+export VLTR_SESSION_FILE=/tmp/e2e/session.json        # desactiva el keyring
+export VLTR_SYNC_SESSION_FILE=/tmp/e2e/sync-session.json
+```
+
+Los dos overrides de sesión son obligatorios para las pruebas: sin ellos cada
+corrida escribe en el keyring real del usuario. `rpassword` abre `/dev/tty`,
+así que los prompts necesitan un pty — con `script -qec "vltr …" /dev/null`
+o similar.

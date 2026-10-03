@@ -22,7 +22,7 @@ Este plan cubre la sección 1–3 del spec. **No** cubre el comando `vltr reset`
 - Migración Supabase: archivo nuevo bajo `supabase/migrations/`, applied-only-additive (sin `drop`).
 - Ningún archivo nuevo de código en `core` que contenga lógica de negocio de sync: `crates/core/src/sync.rs` ya la tiene y sigue siendo su casa.
 - Base de test de Supabase: `https://qabqeiyyviauvxzmblze.supabase.co`, publishable key `sb_publishable_Cmt3PDbV0ACaOMLHW01Ong_pJ1WhzWE` (solo lectura/anón; nunca `service_role`).
-- La cuenta `e2e@vaultr.test` **no sirve** para signup ni recovery: GoTrue la rechaza con `400 email_address_invalid`. Para cualquier prueba que necesite sesión hay que usar una dirección entregable real.
+- **CORREGIDO el 2026-10-03:** esta nota era falsa. GoTrue no rechaza el TLD `.test`; `e2e@vaultr.test` existe, está confirmada y el login funciona. El bloqueo real era la master password del vault sembrado, que se desconocía.
 
 ## Review Focus
 

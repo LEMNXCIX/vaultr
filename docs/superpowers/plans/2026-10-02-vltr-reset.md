@@ -1011,7 +1011,7 @@ Add the three choices — discard local, keep local, cancel — with what each d
 
 Add steps covering: a reset with the wrong confirmation phrase aborts untouched; a successful reset leaves the remote with zero live rows; a second device prompts on its next sync and its three choices do what the docs say; a reset interrupted mid-wipe is completed by the next sync.
 
-Note in the checklist that items needing a real account cannot run on the existing `vaultr.test` project — GoTrue rejects that TLD, verified as `400 email_address_invalid`.
+CORRECTED 2026-10-03: this was false. GoTrue does not reject the `.test` TLD; `e2e@vaultr.test` exists and authenticates. The real blocker was the unknown master password of the seeded vault, solved with `vltr reset`.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -1029,5 +1029,5 @@ git commit -m "docs(sync): document reset and the divergence prompt"
 ## Execution notes
 
 - **This plan has no server migration.** Every column it needs landed in `0002_key_epoch_verifier.sql`. If you find yourself wanting a new column, that is a design question, not an implementation detail — stop and report.
-- **The HTTP paths are untested by the unit suite.** `push_reset`, `reset_remote` and `discard_local_and_adopt` all need a live server, and this project has no usable account: the only one, `e2e@vaultr.test`, is rejected by GoTrue with `400 email_address_invalid`. The unit tests pin the pure parts and the docs carry a manual checklist. Say this plainly in the final report rather than implying E2E coverage.
+- **SUPERSEDED 2026-10-03.** Two claims here were wrong. (1) `e2e@vaultr.test` is not rejected by GoTrue — it exists and authenticates. (2) The HTTP paths are now covered: four integration tests against a PostgREST harness (`crates/core/tests/reset_sync_http.rs`) plus an end-to-end run against the live project, which is what found `PGRST102` and the adoption bug the harness had missed.
 - **Do not write to the Supabase project** while implementing this plan. The reset's whole point is to wipe a remote, and this project's remote holds the user's real 101 encrypted variables.

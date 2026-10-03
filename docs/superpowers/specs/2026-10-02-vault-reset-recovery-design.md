@@ -203,8 +203,15 @@ Recuperar el password de Supabase, que es la precondición para el reset online.
    cliente llama `PUT {base}/auth/v1/user` con `Authorization: Bearer <token>` y el
    password nuevo, y guarda la sesión resultante con el mismo camino que `login`.
 
-Restricciones a documentar: GoTrue rechaza dominios reservados, entre ellos `.test`
-(verificado: `400 email_address_invalid`). El correo de la cuenta debe ser entregable.
+Restricciones a documentar: el correo de la cuenta debe ser entregable, porque
+la confirmación de email no se puede recibir en un dominio inexistente.
+
+> **Corrección (2026-10-03).** Este spec afirmaba, como verificado, que GoTrue
+> rechaza el TLD `.test` con `400 email_address_invalid`. Es falso: `e2e@vaultr.test`
+> se puede registrar, confirmar y autenticar contra el proyecto real. No lo
+> comprobamos hasta esa fecha, y la suposición se propagó a tres documentos más
+> como si fuera un hecho. Lo que sí es cierto es la necesidad de un correo
+> entregable, por la confirmación.
 
 Orden recomendado, y el que la CLI debe sugerir cuando ambas fallen: `vltr recover`
 primero, `vltr reset` después.
