@@ -324,19 +324,23 @@ impl App {
     /// Unlock using a key already loaded (e.g. from OS keyring or a local session file).
     ///
     /// A key that cannot open THIS vault's verifier is provably not this vault's
-    /// key, so both rejection paths drop the persisted session before returning
-    /// the same error. The decrypt failure is the one that matters: after
-    /// [`App::reset_local`], a [`App::rekey`] or an adoption, the stored session
-    /// holds the OLD key, and that key fails to decrypt rather than decrypting to
-    /// the wrong marker. Returning early on it left a session that can open
-    /// nothing in place for its full sliding TTL, so every command kept
-    /// re-probing it and kept answering "invalid master password" instead of
-    /// asking — and the password that works is the new one, which the message
-    /// never mentions.
+    /// key, so the rejection path drops the persisted session before returning.
+    /// The decrypt failure is the one that matters: after [`App::reset_local`],
+    /// an [`App::rekey`] or an adoption, the stored session holds the OLD key,
+    /// and that key fails to decrypt rather than decrypting to the wrong marker.
+    /// Returning early on it left a session that can open nothing in place for
+    /// its full sliding TTL, so every command kept re-probing it and kept
+    /// answering "invalid master password" instead of asking — and the password
+    /// that works is the new one, which the message never mentions.
     ///
     /// Nothing is lost by clearing: the only caller is
     /// [`App::try_unlock_from_session`], so the key being rejected is the one
     /// that was just read out of the session.
+    ///
+    /// That claim needs the drop to have happened, so the clear is propagated
+    /// rather than discarded: a session store that refuses to let go is returned
+    /// in place of the rejection, because a surviving entry is exactly the state
+    /// that answers "invalid master password" to every later command.
     pub fn unlock_with_key(&mut self, key: MasterKey) -> Result<(), CoreError> {
         if !self.storage.is_initialized()? {
             return Err(CoreError::Other("vault not initialized".into()));
@@ -345,7 +349,7 @@ impl App {
         let opens_this_vault = decrypt(&key, &meta.verifier_ct, &meta.verifier_nonce)
             .is_ok_and(|marker| marker.as_str() == models::constants::VAULT_VERIFIER_MESSAGE);
         if !opens_this_vault {
-            let _ = session::clear_session(self.storage.db_path());
+            session::clear_session(self.storage.db_path())?;
             return Err(CoreError::invalid_password());
         }
         self.master_key = Some(key);

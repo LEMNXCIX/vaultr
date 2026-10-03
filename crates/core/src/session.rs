@@ -132,6 +132,68 @@ fn keyring_calls() -> usize {
     keyring_probe::calls()
 }
 
+/// Test-only: what the next `delete_credential` should answer with.
+///
+/// `clear_session` has to tell "there was nothing to clear" apart from "I could
+/// not clear it", and neither outcome can be produced on demand from a live
+/// backend: the only fault reachable without touching the user's keyring is a
+/// keyring that is not there at all, which is precisely the case that must keep
+/// succeeding. A namespace or a file-permission trick does not help — a session
+/// keyring created by `keyctl new_session` is writable by the very user whose
+/// entry would have to be denied, so the "refuses" case never shows up.
+///
+/// So the answer is injected here, below the point where the distinction is
+/// made, and it travels through the real [`keyring::Error`] classification
+/// rather than around it. Thread-local like [`keyring_probe`], so a fault armed
+/// by one test cannot reach another test running in parallel.
+#[cfg(test)]
+mod keyring_fault {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeleteFault {
+        /// Consult the backend.
+        None,
+        /// The backend has no such entry: nothing to clear.
+        NoEntry,
+        /// The backend holds an entry and refuses to drop it.
+        Refused,
+    }
+
+    #[derive(Debug)]
+    struct Refused;
+
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("injected fault: the keyring refused the delete")
+        }
+    }
+
+    impl std::error::Error for Refused {}
+
+    thread_local! {
+        static DELETE_FAULT: Cell<DeleteFault> = const { Cell::new(DeleteFault::None) };
+    }
+
+    /// Arm the fault and hand the previous state back, so a test can restore it.
+    pub(super) fn arm(fault: DeleteFault) -> DeleteFault {
+        DELETE_FAULT.with(|cell| cell.replace(fault))
+    }
+
+    pub(super) fn armed() -> DeleteFault {
+        DELETE_FAULT.with(Cell::get)
+    }
+
+    /// The injected answer for this delete, or the backend's own.
+    pub(super) fn delete_entry(entry: &keyring::Entry) -> keyring::Result<()> {
+        match armed() {
+            DeleteFault::None => entry.delete_credential(),
+            DeleteFault::NoEntry => Err(keyring::Error::NoEntry),
+            DeleteFault::Refused => Err(keyring::Error::PlatformFailure(Box::new(Refused))),
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -326,6 +388,13 @@ pub fn load_master_key(db_path: Option<&Path>) -> Result<Option<MasterKey>, Core
 }
 
 /// Clear the persisted session of `db_path` only.
+///
+/// Reports whether the master key actually left both stores. `vltr lock` prints
+/// "Session cleared." on `Ok(())` and nothing else, so an `Ok(())` that no
+/// delete backed was a printed lie about the one command people run when they
+/// walk away from the machine. Both halves are always attempted — a keyring
+/// that refuses must not also strand the session file — and a failure in either
+/// is returned.
 pub fn clear_session(db_path: Option<&Path>) -> Result<(), CoreError> {
     let Some(db_path) = db_path else {
         return Ok(());
@@ -334,9 +403,9 @@ pub fn clear_session(db_path: Option<&Path>) -> Result<(), CoreError> {
     if session_file_override().is_some() {
         return stop_memory_file(db_path);
     }
-    let _ = clear_keyring(db_path);
-    let _ = stop_memory_file(db_path);
-    Ok(())
+    let keyring = clear_keyring(db_path);
+    let file = stop_memory_file(db_path);
+    keyring.and(file)
 }
 
 /// Inspect the current session of `db_path` without refreshing its TTL.
@@ -422,14 +491,39 @@ fn load_keyring(db_path: &Path) -> Result<Option<MasterKey>, CoreError> {
     Ok(Some(key))
 }
 
+/// Delete this vault's keyring entry, with the test seam that can make the
+/// backend refuse (see [`keyring_fault`]).
+fn delete_entry(entry: &Entry) -> keyring::Result<()> {
+    #[cfg(test)]
+    {
+        keyring_fault::delete_entry(entry)
+    }
+    #[cfg(not(test))]
+    {
+        entry.delete_credential()
+    }
+}
+
 fn clear_keyring(db_path: &Path) -> Result<(), CoreError> {
-    let entry = match entry(db_path) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
+    // No backend to talk to (a box whose keyring cannot even name an entry).
+    // `save_keyring` failed the same way and fell back to the session file, so
+    // there is no entry here and nothing to clear — `lock` must still work on
+    // WSL and on headless machines, which is where it is run most.
+    let Ok(entry) = entry(db_path) else {
+        return Ok(());
     };
-    match entry.delete_credential() {
+    match delete_entry(&entry) {
+        // The entry was never there, or the backend reports it as absent. Same
+        // state a successful delete leaves behind: no key left in the keyring.
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Ok(()),
+        // A backend that holds the entry and refuses the delete is the one case
+        // that leaves the master key reachable after `vltr lock`. This used to
+        // be discarded, so the CLI printed "Session cleared." over a vault that
+        // was still open.
+        Err(e) => Err(CoreError::Other(format!(
+            "could not clear the OS keyring session entry ({e}); \
+             the master key is still in the keyring"
+        ))),
     }
 }
 
@@ -693,6 +787,50 @@ mod tests {
 
         clear_session(Some(&db)).unwrap();
         std::env::remove_var("VLTR_SESSION_FILE");
+    }
+
+    #[test]
+    fn clear_session_reports_a_keyring_that_refused_the_delete() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        // No override: the override branch never reaches the keyring, and this
+        // is the branch `vltr lock` takes on a normal machine.
+        std::env::remove_var("VLTR_SESSION_FILE");
+
+        // A backend that holds the entry and answers the delete with a refusal.
+        keyring_fault::arm(keyring_fault::DeleteFault::Refused);
+        let result = clear_session(Some(&db));
+        keyring_fault::arm(keyring_fault::DeleteFault::None);
+
+        // `vltr lock` prints "Session cleared." exactly when this returns `Ok`.
+        // The master key is still in that keyring, so the vault is still open.
+        let error = result.expect_err("a refused delete must not be reported as cleared");
+        assert!(
+            error.to_string().contains("keyring"),
+            "the error must name the store that refused, got: {error}"
+        );
+    }
+
+    #[test]
+    fn clear_session_succeeds_when_the_keyring_has_nothing_to_clear() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        std::env::remove_var("VLTR_SESSION_FILE");
+
+        // The trap the fix has to avoid: on a WSL box or a headless machine
+        // there is no entry, or no backend at all, and `lock` must still work.
+        keyring_fault::arm(keyring_fault::DeleteFault::NoEntry);
+        let absent = clear_session(Some(&db));
+        keyring_fault::arm(keyring_fault::DeleteFault::None);
+
+        absent.unwrap_or_else(|e| panic!("an absent entry is not a failure: {e}"));
+
+        // And the unarmmed case, which is what those machines actually hit:
+        // no entry in the real keyring for a database that never unlocked.
+        clear_session(Some(&db))
+            .unwrap_or_else(|e| panic!("nothing stored must not be a failure: {e}"));
     }
 
     #[test]
