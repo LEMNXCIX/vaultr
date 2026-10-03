@@ -1250,13 +1250,71 @@ fn unlock_lines(
     }
 }
 
+/// What `warn_if_session_unavailable` has to say about the session it just
+/// tried to save, given the store that answered and the error left pending by
+/// a failed `save_master_key`.
+///
+/// Split out so the decision is testable without a TTY, exactly as
+/// [`session_status_lines`] is for `print_session_status` — and it reads the
+/// two inputs in the same order that function does: the pending error FIRST,
+/// then the store.
+///
+/// The order is the whole fix. This warning used to consult the store only to
+/// decide whether a store existed at all, which made it diagnose a failed save
+/// as "no session store could be saved" — while the state it was describing is
+/// the one where a store DID answer, holding the PREVIOUS entry that the
+/// failed write left behind. Worse, its second half ("the password will be
+/// requested for future commands") is a prediction, and in that state it is
+/// false: the next command finds the stale entry and answers "invalid master
+/// password" for the rest of its TTL instead of asking. It never lied about
+/// the vault, but it sent the user after the wrong diagnosis and the wrong
+/// recovery.
+///
+/// `None` is the only state where nothing is stored and asking again is the
+/// truth, so that is the only arm that keeps the old sentence.
+fn session_warning_lines(
+    store: Option<vltr_core::session::SessionStore>,
+    save_error: Option<&str>,
+) -> Vec<String> {
+    if let Some(reason) = save_error {
+        return match store {
+            // Nothing is stored, so nothing can be stale: the next command
+            // simply asks for the password again, which is what this says.
+            None => vec![format!(
+                "Warning: the new master key could not be saved to the session store ({reason}); \
+                 the password will be requested for future commands."
+            )],
+            // A store DID answer — about the entry the failed write left
+            // behind, not about the key now in use. So the save cannot be
+            // claimed, and the stale entry has to be cleared before another
+            // command can open this vault.
+            Some(_) => vec![format!(
+                "Warning: the new master key could not be saved to the session store ({reason}); \
+                 a session from an earlier unlock may still be stored there with the old key, so \
+                 every other command will fail until you run `vltr lock` and `vltr unlock` again."
+            )],
+        };
+    }
+    match store {
+        Some(_) => Vec::new(),
+        None => vec![
+            "Warning: no session store is available; the password will be requested for \
+             future commands."
+                .into(),
+        ],
+    }
+}
+
+/// Warn about the session `open_and_unlock` / `unlock_for_adoption` just saved,
+/// or failed to save.
 fn warn_if_session_unavailable(app: &mut App) {
-    if let Some(reason) = app.take_session_error() {
-        eprintln!("Warning: no session store could be saved ({reason}); the password will be requested for future commands.");
-    } else if !app.has_keyring_session().unwrap_or(false) {
-        eprintln!(
-            "Warning: no session store is available; the password will be requested for future commands."
-        );
+    // Taken before the store is asked, and taken unconditionally: the error is
+    // consumed on read, so asking the store first would decide by accident
+    // whether anybody gets to hear about a failed save.
+    let save_error = app.take_session_error();
+    let store = app.session_store().ok().flatten();
+    for line in session_warning_lines(store, save_error.as_deref()) {
+        eprintln!("{line}");
     }
 }
 
@@ -1484,6 +1542,83 @@ mod tests {
         );
         assert_eq!(
             session_status_lines(None, None),
+            vec![
+                "Warning: no session store is available; the password will be requested for \
+                 future commands."
+            ],
+        );
+    }
+
+    /// `warn_if_session_unavailable` — the warning every unlocked command shows
+    /// when it had to ask for the password — must not blame a store that
+    /// answered.
+    ///
+    /// The state is the one bug 2 was about: `save_master_key` fails writing the
+    /// NEW key while the PREVIOUS entry is still in place, so `session_store()`
+    /// answers `Some(..)`. The old wording said "no session store could be
+    /// saved ... the password will be requested for future commands", which is
+    /// wrong twice over: a store DID answer, and with a stale entry the next
+    /// command does NOT ask — it finds that entry and answers "invalid master
+    /// password" for the rest of its TTL.
+    #[test]
+    fn a_failed_session_save_is_never_blamed_on_a_store_that_answered() {
+        use vltr_core::session::SessionStore;
+        let reason = "keyring: no such interface";
+
+        for store in [Some(SessionStore::Keyring), Some(SessionStore::Memory)] {
+            let lines = session_warning_lines(store, Some(reason));
+            let said = lines.join(" | ");
+            assert_eq!(lines.len(), 1, "{store:?}: one warning, got {lines:?}");
+            assert!(
+                said.contains(reason),
+                "{store:?}: the failure itself must be shown, got {said:?}"
+            );
+            assert!(
+                !said.contains("no session store could be saved"),
+                "{store:?}: a store DID answer — that diagnosis sends the user after the wrong \
+                 thing, got {said:?}"
+            );
+            assert!(
+                !said.contains("the password will be requested"),
+                "{store:?}: with a stale entry stored, the next command does not ask for a \
+                 password — it fails on that entry. Got {said:?}"
+            );
+            assert!(
+                said.contains("vltr lock") && said.contains("vltr unlock"),
+                "{store:?}: the stale entry has to be cleared and rewritten, so both steps have \
+                 to be named. Got {said:?}"
+            );
+        }
+
+        // No store at all: nothing is stored, so nothing can be stale and
+        // asking for the password again is exactly right.
+        let lines = session_warning_lines(None, Some(reason));
+        assert_eq!(
+            lines,
+            vec![format!(
+                "Warning: the new master key could not be saved to the session store ({reason}); \
+                 the password will be requested for future commands."
+            )]
+        );
+    }
+
+    /// The counterpart, so the fix above cannot pass by warning about
+    /// everything: a session that saved fine says nothing, and a vault with no
+    /// session at all keeps its pre-existing warning.
+    #[test]
+    fn a_healthy_session_store_is_not_warned_about() {
+        use vltr_core::session::SessionStore;
+
+        assert!(
+            session_warning_lines(Some(SessionStore::Keyring), None).is_empty(),
+            "a keyring session needs no comment"
+        );
+        assert!(
+            session_warning_lines(Some(SessionStore::Memory), None).is_empty(),
+            "the local session file is a working session; this warning never mentioned it"
+        );
+        assert_eq!(
+            session_warning_lines(None, None),
             vec![
                 "Warning: no session store is available; the password will be requested for \
                  future commands."
