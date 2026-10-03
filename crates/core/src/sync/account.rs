@@ -156,8 +156,18 @@ pub(super) fn clear_supabase_session() -> Result<(), CoreError> {
     // Override: se borra el archivo y el keyring no se toca. Sin override esto
     // no borra el archivo de fallback, igual que antes.
     if let Some(path) = sync_session_file_override() {
-        let _ = std::fs::remove_file(path);
-        return Ok(());
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // Nothing to log out of: same state a successful delete leaves.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // The file holds this account's Supabase tokens. Reporting success
+            // here printed "Sesión de sincronización cerrada." next to a
+            // session file that was still on disk and still loadable.
+            Err(e) => Err(CoreError::Other(format!(
+                "could not delete the sync session file ({e}); \
+                 the account's Supabase tokens are still stored there"
+            ))),
+        };
     }
     let entry = supabase_entry()?;
     match entry.delete_credential() {

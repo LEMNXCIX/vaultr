@@ -1012,6 +1012,29 @@ fn sync_session_override_missing_file_is_not_logged_in() {
 }
 
 #[test]
+fn sync_session_override_reports_a_file_it_could_not_delete() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    // The override file holds the account's Supabase tokens, and the delete has
+    // to fail for a reason no user privilege can talk the process out of: a
+    // directory in its place answers `unlink` with EISDIR.
+    let path = dir.path().join("sync-session.json");
+    std::fs::create_dir(&path).unwrap();
+    std::env::set_var("VLTR_SYNC_SESSION_FILE", &path);
+
+    let error = clear_supabase_session()
+        .expect_err("a sync session file that survived the delete must not be reported as closed");
+    assert!(
+        error.to_string().contains("sync session"),
+        "the error must name what could not be removed, got: {error}"
+    );
+    assert!(path.exists(), "the file is still there, which is the point");
+
+    std::fs::remove_dir(&path).unwrap();
+    std::env::remove_var("VLTR_SYNC_SESSION_FILE");
+}
+
+#[test]
 fn blank_sync_session_override_falls_back_to_the_default_file() {
     let _guard = env_lock();
     std::env::remove_var("VLTR_SYNC_SESSION_FILE");
