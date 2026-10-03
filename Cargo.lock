@@ -2396,6 +2396,7 @@ dependencies = [
  "keyring",
  "models",
  "reqwest",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",
