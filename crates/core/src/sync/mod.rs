@@ -262,7 +262,11 @@ impl App {
         let variables = self.storage.live_variables()?;
         let mut reencrypted = Vec::with_capacity(variables.len());
         for var in &variables {
-            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce)?;
+            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce).map_err(|_| {
+                CoreError::VariableNotDecryptable {
+                    key: var.key.clone(),
+                }
+            })?;
             let (ciphertext, nonce) = encrypt(&new_key, plaintext.as_str())?;
             reencrypted.push((var.id, ciphertext, nonce));
         }

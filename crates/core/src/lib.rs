@@ -64,6 +64,36 @@ pub enum CoreError {
     ReadOnly,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A live variable could not be re-encrypted during a key rotation —
+    /// `vltr rekey`, or the "keep what is local" branch of the divergence
+    /// prompt.
+    ///
+    /// This exists because the alternative was a lie. Both call sites reach it
+    /// through `?` on `decrypt`, which surfaces as `decryption failed (wrong key
+    /// or corrupted data)`: a bare sentence that names neither the row nor the
+    /// operation, and points at the key — which, at that point in a rotation, is
+    /// provably *not* the problem. The user just unlocked with it and every
+    /// other row opened.
+    ///
+    /// What actually happened is narrower and stranger: this one row's ciphertext
+    /// belongs to a key domain this device no longer holds. A pull can deliver
+    /// a row another device wrote, and the salt is what identifies a domain, so
+    /// the row arrived under a key the salt no longer describes. Tombstones are
+    /// exempt — nothing reads them, so they are skipped rather than decrypted.
+    ///
+    /// The message therefore names the row and says what is true, instead of
+    /// blaming the key the user just proved correct.
+    #[error(
+        "cannot rotate the master key: the value of `{key}` was written under a \
+         different key domain and this device cannot read it, so it cannot re-encrypt it. \
+         Nothing has been changed — the vault is exactly as it was. This normally means one \
+         live row reached this vault from a device that has since rotated or reset its key."
+    )]
+    VariableNotDecryptable {
+        /// The variable's key, which is metadata the user already sees in
+        /// `vltr ls` — not the value, which is never named or held here.
+        key: String,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -264,7 +294,11 @@ impl App {
         let count = variables.len();
         let mut reencrypted = Vec::with_capacity(count);
         for var in &variables {
-            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce)?;
+            let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce).map_err(|_| {
+                CoreError::VariableNotDecryptable {
+                    key: var.key.clone(),
+                }
+            })?;
             let (ciphertext, nonce) = encrypt(&new_key, plaintext.as_str())?;
             reencrypted.push((var.id, ciphertext, nonce));
         }

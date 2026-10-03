@@ -445,9 +445,34 @@ fn a_live_row_rekey_cannot_decrypt_still_refuses_and_changes_nothing() {
         .rekey(secret(NEW_PASSWORD))
         .expect_err("a live row that will not decrypt must stop the rotation");
 
-    let CoreError::Crypto(crypto::CryptoError::Decryption) = err else {
-        panic!("expected a decryption failure, got {err:?}");
+    let CoreError::VariableNotDecryptable { key } = &err else {
+        panic!("expected a named unreadable-row refusal, got {err:?}");
     };
+
+    // The message is the deliverable, so pin what it has to say. "decryption
+    // failed (wrong key or corrupted data)" named neither the row nor the
+    // operation, and blamed the key the user had just proved correct by
+    // unlocking with it.
+    assert_eq!(
+        key, "LIVE",
+        "the message must name the row that cannot be read"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LIVE") && msg.contains("rekey") || msg.contains("rotate"),
+        "the message must name the row and the operation, got: {msg}"
+    );
+    assert!(
+        msg.contains("Nothing has been changed"),
+        "the message must say the vault is untouched, so the user knows \
+         re-running is safe: {msg}"
+    );
+    assert!(
+        !msg.contains("corrupted") && !msg.contains("wrong key"),
+        "the message must not blame the key or corruption — both are wrong \
+         here, and one of them sends the user looking for a bug that is not \
+         there: {msg}"
+    );
 
     // Nothing moved. The vault is still the vault the user's password opens.
     let meta_after = Storage::open(&db)
