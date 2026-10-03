@@ -164,7 +164,9 @@ impl App {
     }
 
     /// Change the master password: rotate the salt, derive a new key and
-    /// re-encrypt every variable (all environments, tombstones included).
+    /// re-encrypt every **live** variable (all environments; tombstones are
+    /// skipped — see the comment at the rotation below, and
+    /// [`Storage::live_variables`]).
     ///
     /// The vault's existing `kdf_params` are kept: they were chosen at init
     /// and a rekey only rotates the secret material (salt + ciphertexts),
@@ -205,7 +207,9 @@ impl App {
     /// plain rekey, which loses the wipe; the reset is the stronger statement
     /// of intent and is the one that must survive a rekey.
     ///
-    /// Returns the number of re-encrypted variables.
+    /// Returns the number of re-encrypted variables: the live rows, since
+    /// tombstones are not touched. This is also what the CLI prints, so it
+    /// counts the secrets the user actually has.
     pub fn rekey(&mut self, new_password: SecretString) -> Result<usize, CoreError> {
         let old_key = self.require_key()?;
         let meta = self.storage.get_vault_meta()?;
@@ -226,7 +230,37 @@ impl App {
             )?;
         }
 
-        let variables = self.storage.all_variables()?;
+        // Live rows only, for the same reason adoption reads only the live ones:
+        // a tombstone's ciphertext is dead weight. A reset tombstones rows
+        // without touching their `value_encrypted`/`nonce`, so a tombstone that
+        // arrived by pull carries a key domain nobody holds any more — the reset
+        // that wrote it destroyed that key. Decrypting those cut the whole
+        // rotation short with `decryption failed` on the first of them, which
+        // made `vltr rekey` impossible on any vault that had ever synced a
+        // remote carrying one. That is a worse dead end than the one adoption
+        // had: rekey has no prompt to decline and no other command that rotates
+        // the master key, and if the remote has not moved on since the tombstone
+        // was pulled then `sync` succeeds silently, so nothing ever surfaces the
+        // state to the user.
+        //
+        // Note the premise this used to rest on — that the local key opens every
+        // row by construction, which is why a rotation could afford
+        // `all_variables` — is false, and the adoption bug is what proved it
+        // false: the rows in question did not come from this device at all.
+        //
+        // A LIVE row that fails to decrypt is still a hard error, below. Same
+        // asymmetry as adoption, and for the same reason: `deleted = true`
+        // means nobody will read that row again, so skipping it loses nothing,
+        // whereas a live row is a secret the user believes they have. Swallowing
+        // it would leave a vault whose verifier advertises one key over
+        // ciphertext from another. Refusing is atomic here — the loop completes
+        // before `apply_key_rotation` is called — so the vault is untouched.
+        //
+        // The count returned is therefore the number of live rows moved, which
+        // is what the CLI reports as "variables re-encrypted". A user with one
+        // secret and a hundred tombstones has one variable, and reporting three
+        // is the number that was wrong.
+        let variables = self.storage.live_variables()?;
         let count = variables.len();
         let mut reencrypted = Vec::with_capacity(count);
         for var in &variables {

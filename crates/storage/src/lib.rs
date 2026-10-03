@@ -653,11 +653,17 @@ impl Storage {
     /// not [`Self::all_variables`]. The difference is not cosmetic: a tombstone
     /// can arrive, by pull, carrying the ciphertext of a key that has since been
     /// rotated away, and then no key at all can open it. That is reachable
-    /// exactly when a vault has synced a remote that reset, which is why
-    /// [`all_variables`] stays for the rotations that own every row (a `rekey`
-    /// on this device, where the local key opens all of them by construction)
-    /// and adoption — whose whole purpose is to move to a domain this device
-    /// does not hold — reads only the live ones.
+    /// exactly when a vault has synced a remote that reset.
+    ///
+    /// Both callers that decrypt every row they touch — a `rekey` on this
+    /// device and an `adopt_remote_key` — read only the live ones. Do not
+    /// "restore" `all_variables` to a rotation on the argument that a rotation
+    /// on this device owns every row and the local key opens all of them by
+    /// construction: it does not own them. The rows a pull delivers were
+    /// written by another device, under whatever key *it* held, and that claim
+    /// is what let one unreadable tombstone abort both operations outright.
+    /// `all_variables` has no production caller left; it stays for tests and
+    /// for anything that must see tombstones without decrypting them.
     pub fn live_variables(&self) -> Result<Vec<Variable>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
