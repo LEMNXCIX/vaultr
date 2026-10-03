@@ -244,7 +244,22 @@ impl App {
         verify_key_against_remote(&client, &session, &new_key, &vault).await?;
 
         let old_key = self.require_key()?;
-        let variables = self.storage.all_variables()?;
+        // Live rows only, deliberately. A tombstone's ciphertext is dead weight:
+        // nothing ever decrypts it, and a reset keeps those bytes as they were,
+        // so a tombstone this device pulled can carry a key domain nobody holds
+        // any more — the key of a vault that has since been reset. Decrypting
+        // those made adoption abort with `decryption failed` on the first of
+        // them, which is every vault that has ever synced a remote carrying
+        // them: the "keep local" choice, the one that exists to prevent data
+        // loss, could not be taken at all. What adoption propagates about a
+        // tombstone is `deleted`, `version` and `updated_at`, so skipping them
+        // loses nothing and leaves their bytes exactly as a reset left them.
+        //
+        // A LIVE row that fails to decrypt is still a hard error, below: it
+        // would mean the local vault's contents disagree with the key this
+        // device is holding, and swallowing that leaves a verifier claiming one
+        // key over ciphertext from another.
+        let variables = self.storage.live_variables()?;
         let mut reencrypted = Vec::with_capacity(variables.len());
         for var in &variables {
             let plaintext = decrypt(old_key, &var.value_encrypted, &var.nonce)?;

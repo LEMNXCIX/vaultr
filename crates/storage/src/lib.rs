@@ -641,6 +641,32 @@ impl Storage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Only the live variable rows, tombstones excluded.
+    ///
+    /// A tombstone's `value_encrypted` and `nonce` are dead weight: no code path
+    /// decrypts them — `get_variable` and `list_variables` filter `deleted = 0`,
+    /// and a reset deliberately keeps those bytes so a device still holding the
+    /// old key can recognise the row. What sync propagates about a tombstone is
+    /// `deleted`, `version` and `updated_at`, never the ciphertext.
+    ///
+    /// So a caller that must *decrypt* every row it touches wants this one and
+    /// not [`Self::all_variables`]. The difference is not cosmetic: a tombstone
+    /// can arrive, by pull, carrying the ciphertext of a key that has since been
+    /// rotated away, and then no key at all can open it. That is reachable
+    /// exactly when a vault has synced a remote that reset, which is why
+    /// [`all_variables`] stays for the rotations that own every row (a `rekey`
+    /// on this device, where the local key opens all of them by construction)
+    /// and adoption — whose whole purpose is to move to a domain this device
+    /// does not hold — reads only the live ones.
+    pub fn live_variables(&self) -> Result<Vec<Variable>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, environment_id, key, value_encrypted, nonce, notes, is_readonly, allow_export, created_at, updated_at, version, deleted
+             FROM variables WHERE deleted = 0",
+        )?;
+        let rows = stmt.query_map([], map_variable)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Search variable keys (and optional notes) across all projects,
     /// optionally scoped to one project and/or environment by name.
     pub fn search_variables(

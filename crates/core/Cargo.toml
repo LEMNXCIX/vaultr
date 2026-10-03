@@ -40,6 +40,10 @@ crypto = { workspace = true }
 storage = { workspace = true }
 sync = { workspace = true }
 hex = { workspace = true }
+# To read and write raw `variables` rows on a device vault in
+# tests/adopt_tombstones.rs: tombstones are unreachable through `App` on
+# purpose, and adoption is decided on exactly the rows `App` hides.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true
