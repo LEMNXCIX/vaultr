@@ -244,16 +244,40 @@ de reintentarse en bucle.
 - Resolución avanzada de conflictos: LWW por `updated_at` (gana la fila más
   reciente).
 
-> **Limitación conocida:** la policy de `vaults` es `for all`, así que cualquier
-> usuario autenticado de la cuenta puede sobrescribir `salt` y `kdf_params` con
-> solo su contraseña de Supabase, sin conocer la master key. El cliente exige la
-> contraseña correcta para adoptar o pushear el meta del vault, pero esa es una
-> política del cliente, no una garantía del servidor: un atacante con la contraseña
-> de la cuenta puede dejar el vault indescifrable. Si además infla `key_epoch`,
-> el marcador `pending_rekey_salt` no autoriza nada, el sync aborta y ningún
-> `rekey` local escapa de ese aborto: el epoch local sigue por detrás y no hay
-> salida desde el cliente. Cerrarlo requiere mover la
-> validación al servidor con un rol que la CLI no tiene.
+> **Un atacante con la contraseña de la cuenta puede sobrescribir el `salt`.**
+> Las cuatro tablas tienen la misma política, `owner_id = auth.uid()` en `USING`
+> y en `WITH_CHECK`, así que RLS no es el fallo: quien entra con tu contraseña
+> entra *como tú*, y `auth.uid()` le da tus filas. Eso es lo que significa tener
+> la contraseña de alguien, no un agujero de la política.
+>
+> Y **sí hay salida desde el cliente**, verificada el 2026-10-04 contra el
+> proyecto real. Este documento afirmaba lo contrario —que el marcador
+> `pending_rekey_salt` "no autoriza nada", que el sync abortaba y que ningún
+> `rekey` escapaba, sin salida. Es exactamente al revés: **ese marcador existe
+> precisamente para autorizar el pisado**. `rekey` es local puro, no consulta el
+> salt remoto, así que funciona igual; y el `sync` siguiente usa el marcador
+> para propagar el meta nuevo por encima del que puso el atacante.
+>
+> Secuencia medida, con el `salt` sobrescrito y el `verifier_ct` puesta a basura
+> por SQL — lo que alguien con la contraseña de la cuenta podría hacer sin la
+> master key:
+>
+> | | |
+> |---|---|
+> | `vltr sync` | aborta con *"la contraseña maestra del vault cambió en otro dispositivo"* y pide la contraseña **remota**, que el atacante no tiene |
+> | `vltr rekey` | **funciona**, código 0: *"Master password changed; 2 variables re-encrypted"* |
+> | `vltr sync` | **funciona**, código 0: pisa el `salt` del atacante, publica un `verifier_ct` real, sube `key_epoch` y marca `key_change = rekey` |
+>
+> El único coste es que la contraseña maestra cambia, lo cual es aceptable: el
+> vault es recuperable y el atacante se queda sin nada. Lo que **no** se puede
+> es recuperar *los secretos* sin esa master key, y para eso la garantía
+> criptográfica es que no hay nada que recuperar: el atacante no puede cifrar
+> bajo una clave que no conoce, solo puede romper lo que hay.
+>
+> Cerrar del todo el ataque —que alguien con la contraseña de la cuenta pueda
+> tocar el meta en absoluto— exigiría mover la validación al servidor con un
+> rol que la CLI no tiene. Lo que queda es inevitable: la contraseña de la cuenta
+> es la credencial.
 
 ## Checklist de verificación E2E (manual)
 
