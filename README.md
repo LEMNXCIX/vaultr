@@ -184,6 +184,18 @@ vltr status --all          # proyectos y environments con su conteo
 vltr projects
 ```
 
+> **`vltr apply` escribe en el directorio de trabajo, no en el del vault.** Y
+> *fusiona* en el `.env` que encuentre ahí, sin avisar: no trunca el archivo, no
+> pide confirmación y no comprueba que el `.env` tenga nada que ver con este
+> vault. Ejecutado desde el directorio equivocado, añade las variables del
+> vault a un `.env` ajeno — en este repo, uno con `OPENAI_API_KEY`,
+> `DATABASE_URL` y `SUPABASE_SECRET_KEY` dentro.
+>
+> No es un bug: es lo que dice la ayuda. Pero la combinación de *destino
+> implícito* + *fusión silenciosa* + *cero aviso* es una trampa real, y no hace
+> falta nada exótico para pisarla. Si vas a aplicarlo sobre un proyecto
+> concreto, `cd` allí primero; y revisa el diff del `.env` después.
+
 Sync opcional con Supabase — solo viaja ciphertext, nunca la master key.
 Ver [docs/SYNC.md](docs/SYNC.md) para el setup y el modelo de conflictos.
 
